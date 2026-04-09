@@ -1,0 +1,10 @@
+# Binary (root-level only, not cmd/wicket/ directory)
+/wicket
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
