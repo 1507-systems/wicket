@@ -1,3 +1,4 @@
+<!-- summary: Local credential broker daemon — exchanges root secrets from Coffer for short-lived scoped tokens via Unix socket. -->
 # Wicket -- Project Log
 
 ## 2026-04-07

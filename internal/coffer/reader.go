@@ -51,7 +51,8 @@ func (r *Reader) Get(path string) (string, error) {
 
 // Set writes a secret back to the coffer vault. Used when a provider issues
 // a new refresh token that must be persisted (e.g., Zoho OAuth rotation).
-// Shells out to `coffer set <path> <value>`.
+// Shells out to `coffer set <path> --stdin` and pipes the value via stdin
+// to avoid exposing the secret in process argument lists (visible via ps).
 func (r *Reader) Set(path, value string) error {
 	if path == "" {
 		return fmt.Errorf("coffer: empty path for set")
@@ -60,8 +61,9 @@ func (r *Reader) Set(path, value string) error {
 		return fmt.Errorf("coffer: empty value for set on path %q", path)
 	}
 
-	cmd := exec.Command("coffer", "set", path, value)
+	cmd := exec.Command("coffer", "set", path, "--stdin")
 	cmd.Dir = r.VaultPath
+	cmd.Stdin = strings.NewReader(value)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {

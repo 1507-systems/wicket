@@ -14,7 +14,7 @@ import (
 
 const (
 	// ntfyEndpoint is the ntfy topic URL for wicket alerts.
-	ntfyEndpoint = "https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+	ntfyEndpoint = "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
 
 	// rateLimitWindow is the minimum interval between notifications of the
 	// same event type. Prevents flooding during sustained outages.

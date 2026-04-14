@@ -4,6 +4,7 @@
 package audit
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -106,10 +107,7 @@ func (l *Logger) ReadLast(n int) ([]Entry, error) {
 
 	// Parse all entries (newline-delimited JSON)
 	var entries []Entry
-	decoder := json.NewDecoder(
-		// Use a bytes reader from the data
-		newBytesReader(data),
-	)
+	decoder := json.NewDecoder(bytes.NewReader(data))
 
 	for decoder.More() {
 		var entry Entry
@@ -142,21 +140,3 @@ func (l *Logger) Close() error {
 	return err
 }
 
-// bytesReader wraps a byte slice for use with json.NewDecoder.
-type bytesReader struct {
-	data []byte
-	pos  int
-}
-
-func newBytesReader(data []byte) *bytesReader {
-	return &bytesReader{data: data}
-}
-
-func (r *bytesReader) Read(p []byte) (int, error) {
-	if r.pos >= len(r.data) {
-		return 0, fmt.Errorf("EOF")
-	}
-	n := copy(p, r.data[r.pos:])
-	r.pos += n
-	return n, nil
-}
