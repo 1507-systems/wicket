@@ -13,7 +13,7 @@
 
 ### Initial Implementation (feat/initial-implementation branch)
 
-- Scaffolded full Go project with `go mod init github.com/shasb/wicket`
+- Scaffolded full Go project with `go mod init github.com/1507-systems/wicket`
 - Built all core packages:
   - `cmd/wicket/main.go`: CLI entry point with subcommands (start, stop, status, get, lock, unlock, audit, providers, version)
   - `internal/daemon/daemon.go`: Unix socket server with connection handling, signal-based shutdown, idle timeout, PID file management
@@ -39,8 +39,8 @@
 
 - Initial implementation complete on `feat/initial-implementation` branch
 - All tests pass, `go vet` clean
-- GitHub repo created: `bryce-shashinka/wicket` (private)
-- Coffer project does not exist yet (prerequisite for actually running the daemon)
+- GitHub repo created: `1507-systems/wicket` (public)
+- Coffer vault exists at `~/dev/coffer/` — prerequisite satisfied
 
 ### Next Steps
 
