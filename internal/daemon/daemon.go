@@ -281,8 +281,10 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 	// Set a reasonable deadline for the entire request-response cycle
 	conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// Authenticate the peer
-	peer, err := AuthenticatePeer(conn)
+	// Authenticate the peer (UID match) and, when allowed_binaries is
+	// configured, enforce the executable allowlist. An empty allowlist keeps
+	// the historical behavior of accepting any same-UID caller.
+	peer, err := AuthenticatePeerWithBinaries(conn, d.cfg.AllowedBinaries)
 	if err != nil {
 		slog.Warn("peer authentication failed", "error", err)
 		d.notifier.Send("unauthorized", "Wicket: Unauthorized Connection", fmt.Sprintf("Peer authentication failed: %v", err))
@@ -342,8 +344,9 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 			Action:    "get",
 			Provider:  req.Provider,
 			Scope:     req.Scope,
-			CallerPID: peer.PID,
-			CallerUID: peer.UID,
+			CallerPID:    peer.PID,
+			CallerUID:    peer.UID,
+			CallerBinary: peer.Binary,
 			Success:   false,
 			Error:     "daemon locked",
 		})
@@ -370,8 +373,9 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 			Action:    "get",
 			Provider:  req.Provider,
 			Scope:     req.Scope,
-			CallerPID: peer.PID,
-			CallerUID: peer.UID,
+			CallerPID:    peer.PID,
+			CallerUID:    peer.UID,
+			CallerBinary: peer.Binary,
 			Success:   false,
 			Error:     "provider not found",
 		})
@@ -396,8 +400,9 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 			Action:    "get",
 			Provider:  req.Provider,
 			Scope:     req.Scope,
-			CallerPID: peer.PID,
-			CallerUID: peer.UID,
+			CallerPID:    peer.PID,
+			CallerUID:    peer.UID,
+			CallerBinary: peer.Binary,
 			Success:   false,
 			Error:     "scope not found",
 		})
@@ -418,8 +423,9 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 			Action:    "get",
 			Provider:  req.Provider,
 			Scope:     req.Scope,
-			CallerPID: peer.PID,
-			CallerUID: peer.UID,
+			CallerPID:    peer.PID,
+			CallerUID:    peer.UID,
+			CallerBinary: peer.Binary,
 			Success:   false,
 			Error:     err.Error(),
 		})

@@ -20,6 +20,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -166,7 +167,10 @@ func (g *GitHub) GetToken(ctx context.Context, scope string, _ map[string]any) (
 		g.mu.Lock()
 		g.healthy = false
 		g.mu.Unlock()
-		return nil, fmt.Errorf("github API returned %d: %s", resp.StatusCode, string(respBody))
+		// Log the full upstream body to the daemon's own log only; do not
+		// echo it back to the client (it may contain sensitive detail).
+		slog.Error("github API error", "provider", g.name, "status", resp.StatusCode, "body", string(respBody))
+		return nil, fmt.Errorf("github API returned status %d", resp.StatusCode)
 	}
 
 	var ghResp struct {
