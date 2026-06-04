@@ -139,7 +139,10 @@ func (z *Zoho) GetToken(ctx context.Context, scope string, _ map[string]any) (*T
 		z.mu.Lock()
 		z.healthy = false
 		z.mu.Unlock()
-		return nil, fmt.Errorf("zoho OAuth returned %d: %s", resp.StatusCode, string(respBody))
+		// Log the full upstream body to the daemon's own log only; do not
+		// echo it back to the client (it may contain sensitive detail).
+		slog.Error("zoho OAuth error", "provider", z.name, "status", resp.StatusCode, "body", string(respBody))
+		return nil, fmt.Errorf("zoho OAuth returned status %d", resp.StatusCode)
 	}
 
 	var oauthResp struct {

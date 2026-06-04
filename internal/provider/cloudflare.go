@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -94,12 +95,20 @@ func (c *Cloudflare) GetToken(ctx context.Context, scope string, opts map[string
 		return nil, fmt.Errorf("scope %q not configured for cloudflare provider %q", scope, c.name)
 	}
 
-	// Allow TTL override via options
+	// Allow TTL override via options, but only to SHORTEN the lifetime.
+	// A caller-supplied ttl must be positive and no greater than the
+	// configured default; anything larger (or non-positive) is rejected so a
+	// client cannot extend a token's lifetime beyond the configured policy.
 	if opts != nil {
 		if ttlStr, ok := opts["ttl"].(string); ok {
-			if parsed, err := time.ParseDuration(ttlStr); err == nil {
-				ttl = parsed
+			parsed, err := time.ParseDuration(ttlStr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid ttl option %q: %w", ttlStr, err)
 			}
+			if parsed <= 0 || parsed > ttl {
+				return nil, fmt.Errorf("ttl option %s out of range: must be > 0 and <= configured default %s", parsed, ttl)
+			}
+			ttl = parsed
 		}
 	}
 
@@ -146,7 +155,10 @@ func (c *Cloudflare) GetToken(ctx context.Context, scope string, opts map[string
 		c.mu.Lock()
 		c.healthy = false
 		c.mu.Unlock()
-		return nil, fmt.Errorf("cloudflare API returned %d: %s", resp.StatusCode, string(respBody))
+		// Log the full upstream body to the daemon's own log only; do not
+		// echo it back to the client (it may contain sensitive detail).
+		slog.Error("cloudflare API error", "provider", c.name, "status", resp.StatusCode, "body", string(respBody))
+		return nil, fmt.Errorf("cloudflare API returned status %d", resp.StatusCode)
 	}
 
 	// Parse the response to extract the token value

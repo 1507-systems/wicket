@@ -538,12 +538,15 @@ idle_timeout: 0  # headless: never auto-lock
 # Audit log location
 audit_log: ~/.config/wicket/audit.log
 
-# Optional: restrict connecting binaries (macOS only, requires LOCAL_PEERPID)
-# This is what enables PID verification. If the list is empty or omitted,
+# Optional: restrict connecting binaries by absolute executable path.
+# The peer's executable is resolved from its PID (macOS: proc_pidpath via
+# LOCAL_PEERPID; Linux: /proc/<pid>/exe). If the list is empty or omitted,
 # only the UID check (getpeereid) is performed -- any process running as
 # the same UID can connect. If populated, BOTH UID and binary path are
 # verified: the connecting process must match the daemon's UID AND its
-# binary path must appear in this list.
+# resolved binary path must appear in this list. When the allowlist is set
+# but the peer executable cannot be resolved, the connection is rejected
+# (fail closed).
 allowed_binaries: []
   # - /usr/local/bin/claude
   # - /opt/homebrew/bin/node
