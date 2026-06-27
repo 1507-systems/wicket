@@ -1,8 +1,70 @@
 name: Close Cortex Issues
+# Self-contained at-merge Cortex issue closer (no cross-repo workflow_call, which
+# is blocked by org Actions policy for private repos). Canonical logic lives in
+# 1507-systems/scripts ci/cortex-close-on-merge.sh; keep in sync. Epic 4a283f45.
 on:
   push:
     branches: [main]
+permissions:
+  contents: read
 jobs:
-  close:
-    uses: 1507-systems/scripts/.github/workflows/close-cortex-issue.yml@main
-    secrets: inherit
+  close-cortex-issue:
+    name: Close referenced Cortex issues
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (need merge commit message)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        with:
+          fetch-depth: 2
+      - name: Close referenced Cortex issues
+        env:
+          CORTEX_WRITE_TOKEN: ${{ secrets.CORTEX_WRITE_TOKEN }}
+          CORTEX_API_BASE: https://cortex.1507.cloud
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.sha }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          COMMIT_MSG="$(git log -1 --format=%B "${HEAD_SHA}" 2>/dev/null || true)"
+          PR_BODY="$(gh api "repos/${REPO}/commits/${HEAD_SHA}/pulls" --jq '.[]?.body // empty' 2>/dev/null || true)"
+          SCAN_TEXT="$(printf '%s\n%s\n' "${COMMIT_MSG}" "${PR_BODY}")"
+          mapfile -t IDS < <(printf '%s' "${SCAN_TEXT}" \
+            | grep -oiE '(^|[^[:alnum:]])(close[sd]?|fix(e[sd])?|resolve[sd]?|retire[sd]?):?[[:space:]]+cortex:issue/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+            | sed -E 's#.*cortex:issue/##' | tr '[:upper:]' '[:lower:]' | sort -u)
+          if [ "${#IDS[@]}" -eq 0 ]; then
+            echo "No cortex:issue/<uuid> closing references. Nothing to close."
+            exit 0
+          fi
+          echo "Found ${#IDS[@]} cortex issue reference(s): ${IDS[*]}"
+          if [ -z "${CORTEX_WRITE_TOKEN}" ]; then
+            echo "::notice::CORTEX_WRITE_TOKEN not set — skipping (no-op)."
+            exit 0
+          fi
+          AUTH=(-H "Authorization: Bearer ${CORTEX_WRITE_TOKEN}")
+          get_version() {
+            local id="$1" resp v
+            for q in status=todo status=in_progress status=backlog status=blocked limit=200; do
+              resp="$(curl -s -f --max-time 10 "${AUTH[@]}" "${CORTEX_API_BASE}/issues?${q}&limit=200" 2>/dev/null)" || continue
+              v="$(printf '%s' "$resp" | jq -r --arg id "$id" '.issues[]? | select(.id==$id) | .version' 2>/dev/null | head -n1)"
+              [ -n "$v" ] && [ "$v" != "null" ] && { printf '%s' "$v"; return 0; }
+            done
+            return 1
+          }
+          for id in "${IDS[@]}"; do
+            version="$(get_version "$id")" || { echo "  ${id}: not found in open issues — skipping."; continue; }
+            for attempt in 1 2; do
+              payload="$(jq -nc --argjson v "$version" --arg id "$id" \
+                --arg note "COMPLETED via merge (gh run ${GITHUB_RUN_ID}) — auto-closed by at-merge hook." \
+                '{version:$v, patch:{status:"done", body:$note}, request_id:("gh-merge-"+env.GITHUB_RUN_ID+"-"+$id)}')"
+              code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X PATCH "${AUTH[@]}" \
+                -H 'Content-Type: application/json' -d "$payload" "${CORTEX_API_BASE}/issues/${id}" 2>/dev/null)"
+              case "$code" in
+                200) echo "  ${id}: closed (status=done)."; break ;;
+                409) echo "  ${id}: version_conflict; re-fetching."; version="$(get_version "$id")" || break ;;
+                403) echo "::warning::${id}: 403 — token lacks write scope."; break ;;
+                *)   echo "::warning::${id}: HTTP ${code} — skipping (non-blocking)."; break ;;
+              esac
+            done
+          done
+          exit 0
