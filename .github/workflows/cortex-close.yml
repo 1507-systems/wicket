@@ -1,0 +1,8 @@
+name: Close Cortex Issues
+on:
+  push:
+    branches: [main]
+jobs:
+  close:
+    uses: 1507-systems/scripts/.github/workflows/close-cortex-issue.yml@main
+    secrets: inherit
