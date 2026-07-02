@@ -21,8 +21,8 @@ import (
 	"time"
 
 	"github.com/1507-systems/wicket/internal/audit"
-	"github.com/1507-systems/wicket/internal/config"
 	"github.com/1507-systems/wicket/internal/coffer"
+	"github.com/1507-systems/wicket/internal/config"
 	"github.com/1507-systems/wicket/internal/notify"
 	"github.com/1507-systems/wicket/internal/protocol"
 	"github.com/1507-systems/wicket/internal/provider"
@@ -33,14 +33,16 @@ import (
 type Daemon struct {
 	cfg       *config.Config
 	listener  net.Listener
+	pmu       sync.RWMutex // guards providers (unlock swaps the map at runtime)
 	providers map[string]provider.TokenProvider
-	coffer   *coffer.Reader
+	coffer    *coffer.Reader
 	auditor   *audit.Logger
 	notifier  *notify.Notifier
+	cache     *tokenCache
 
 	// State tracking
-	startTime   time.Time
-	lastRequest atomic.Value // *time.Time
+	startTime    time.Time
+	lastRequest  atomic.Value // *time.Time
 	tokensIssued atomic.Int64
 	locked       atomic.Bool
 
@@ -66,9 +68,10 @@ func New(cfg *config.Config) (*Daemon, error) {
 	d := &Daemon{
 		cfg:       cfg,
 		providers: make(map[string]provider.TokenProvider),
-		coffer:   coffer.NewReader(cfg.CofferPath),
+		coffer:    coffer.NewReader(cfg.CofferPath),
 		auditor:   auditor,
 		notifier:  notify.NewNotifier(),
+		cache:     newTokenCache(),
 		startTime: time.Now(),
 		ctx:       ctx,
 		cancel:    cancel,
@@ -79,15 +82,27 @@ func New(cfg *config.Config) (*Daemon, error) {
 
 // LoadProviders reads root credentials from coffer and initializes all
 // configured providers. This is called on startup and after unlock.
+// Providers are built into a fresh map that replaces the old one atomically,
+// so a partial failure never leaves a half-initialized registry.
 func (d *Daemon) LoadProviders() error {
+	fresh := make(map[string]provider.TokenProvider, len(d.cfg.Providers))
 	for name, pcfg := range d.cfg.Providers {
 		p, err := d.initProvider(name, pcfg)
 		if err != nil {
+			// Zero whatever credentials were already loaded into the
+			// abandoned map before bailing out.
+			for _, loaded := range fresh {
+				loaded.Close()
+			}
 			return fmt.Errorf("failed to initialize provider %q: %w", name, err)
 		}
-		d.providers[name] = p
+		fresh[name] = p
 		slog.Info("loaded provider", "name", name, "type", pcfg.Type, "scopes", p.Scopes())
 	}
+
+	d.pmu.Lock()
+	d.providers = fresh
+	d.pmu.Unlock()
 	return nil
 }
 
@@ -327,6 +342,8 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		d.handleAudit(conn, &req)
 	case "lock":
 		d.handleLock(conn)
+	case "unlock":
+		d.handleUnlock(conn)
 	default:
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: fmt.Sprintf("unknown action: %q", req.Action),
@@ -340,15 +357,15 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 	// Check if daemon is locked
 	if d.locked.Load() {
 		d.auditor.Log(audit.Entry{
-			Timestamp: time.Now().UTC(),
-			Action:    "get",
-			Provider:  req.Provider,
-			Scope:     req.Scope,
+			Timestamp:    time.Now().UTC(),
+			Action:       "get",
+			Provider:     req.Provider,
+			Scope:        req.Scope,
 			CallerPID:    peer.PID,
 			CallerUID:    peer.UID,
 			CallerBinary: peer.Binary,
-			Success:   false,
-			Error:     "daemon locked",
+			Success:      false,
+			Error:        "daemon locked",
 		})
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: "daemon locked",
@@ -366,18 +383,20 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 	}
 
 	// Find the provider
+	d.pmu.RLock()
 	p, ok := d.providers[req.Provider]
+	d.pmu.RUnlock()
 	if !ok {
 		d.auditor.Log(audit.Entry{
-			Timestamp: time.Now().UTC(),
-			Action:    "get",
-			Provider:  req.Provider,
-			Scope:     req.Scope,
+			Timestamp:    time.Now().UTC(),
+			Action:       "get",
+			Provider:     req.Provider,
+			Scope:        req.Scope,
 			CallerPID:    peer.PID,
 			CallerUID:    peer.UID,
 			CallerBinary: peer.Binary,
-			Success:   false,
-			Error:     "provider not found",
+			Success:      false,
+			Error:        "provider not found",
 		})
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: fmt.Sprintf("provider %q not configured", req.Provider),
@@ -396,15 +415,15 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 	}
 	if !validScope {
 		d.auditor.Log(audit.Entry{
-			Timestamp: time.Now().UTC(),
-			Action:    "get",
-			Provider:  req.Provider,
-			Scope:     req.Scope,
+			Timestamp:    time.Now().UTC(),
+			Action:       "get",
+			Provider:     req.Provider,
+			Scope:        req.Scope,
 			CallerPID:    peer.PID,
 			CallerUID:    peer.UID,
 			CallerBinary: peer.Binary,
-			Success:   false,
-			Error:     "scope not found",
+			Success:      false,
+			Error:        "scope not found",
 		})
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: fmt.Sprintf("scope %q not available for provider %q", req.Scope, req.Provider),
@@ -413,21 +432,55 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 		return
 	}
 
+	// Serve from the cache when the token still has >30% of its TTL left
+	// (SPEC "Token Caching"). Requests carrying provider-specific overrides
+	// (custom TTL, zone filter, ...) bypass the cache entirely: a token
+	// minted under different options must not be reused, and an
+	// options-shaped token must not shadow the default one. Cache hits are
+	// audited like fresh issuances: the caller still received a token.
+	now := time.Now()
+	cacheable := len(req.Options) == 0
+	if cacheable {
+		if cached := d.cache.get(req.Provider, req.Scope, now); cached != nil {
+			d.tokensIssued.Add(1)
+			d.auditor.Log(audit.Entry{
+				Timestamp:    now.UTC(),
+				Action:       "get",
+				Provider:     req.Provider,
+				Scope:        req.Scope,
+				CallerPID:    peer.PID,
+				CallerUID:    peer.UID,
+				CallerBinary: peer.Binary,
+				TokenType:    cached.Type,
+				ExpiresAt:    cached.ExpiresAt,
+				Success:      true,
+			})
+			writeJSON(conn, protocol.Response{
+				Token:     cached.Value,
+				ExpiresAt: cached.ExpiresAt,
+				Provider:  cached.Provider,
+				Scope:     cached.Scope,
+				Type:      cached.Type,
+			})
+			return
+		}
+	}
+
 	// Request the token
 	token, err := p.GetToken(d.ctx, req.Scope, req.Options)
 	if err != nil {
 		slog.Error("token exchange failed", "provider", req.Provider, "scope", req.Scope, "error", err)
 
 		d.auditor.Log(audit.Entry{
-			Timestamp: time.Now().UTC(),
-			Action:    "get",
-			Provider:  req.Provider,
-			Scope:     req.Scope,
+			Timestamp:    time.Now().UTC(),
+			Action:       "get",
+			Provider:     req.Provider,
+			Scope:        req.Scope,
 			CallerPID:    peer.PID,
 			CallerUID:    peer.UID,
 			CallerBinary: peer.Binary,
-			Success:   false,
-			Error:     err.Error(),
+			Success:      false,
+			Error:        err.Error(),
 		})
 
 		writeJSON(conn, protocol.ErrorResponse{
@@ -437,18 +490,25 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 		return
 	}
 
+	// Cache for reuse while >30% of the TTL remains (no-op for passthrough
+	// tokens, which have no expiry; options-shaped tokens are never cached)
+	if cacheable {
+		d.cache.put(req.Provider, req.Scope, token, now)
+	}
+
 	// Log the successful issuance
 	d.tokensIssued.Add(1)
 	d.auditor.Log(audit.Entry{
-		Timestamp: time.Now().UTC(),
-		Action:    "get",
-		Provider:  req.Provider,
-		Scope:     req.Scope,
-		CallerPID: peer.PID,
-		CallerUID: peer.UID,
-		TokenType: token.Type,
-		ExpiresAt: token.ExpiresAt,
-		Success:   true,
+		Timestamp:    time.Now().UTC(),
+		Action:       "get",
+		Provider:     req.Provider,
+		Scope:        req.Scope,
+		CallerPID:    peer.PID,
+		CallerUID:    peer.UID,
+		CallerBinary: peer.Binary,
+		TokenType:    token.Type,
+		ExpiresAt:    token.ExpiresAt,
+		Success:      true,
 	})
 
 	writeJSON(conn, protocol.Response{
@@ -467,11 +527,15 @@ func (d *Daemon) handleStatus(conn net.Conn) {
 		lastReq = v.(*time.Time)
 	}
 
+	d.pmu.RLock()
+	providersLoaded := len(d.providers)
+	d.pmu.RUnlock()
+
 	writeJSON(conn, protocol.StatusResponse{
 		Status:          statusString(d.locked.Load()),
 		Locked:          d.locked.Load(),
 		UptimeSeconds:   int64(time.Since(d.startTime).Seconds()),
-		ProvidersLoaded: len(d.providers),
+		ProvidersLoaded: providersLoaded,
 		TokensIssued:    d.tokensIssued.Load(),
 		LastRequest:     lastReq,
 	})
@@ -479,6 +543,9 @@ func (d *Daemon) handleStatus(conn net.Conn) {
 
 // handleProviders returns information about all loaded providers.
 func (d *Daemon) handleProviders(conn net.Conn) {
+	d.pmu.RLock()
+	defer d.pmu.RUnlock()
+
 	infos := make([]protocol.ProviderInfo, 0, len(d.providers))
 	for _, p := range d.providers {
 		infos = append(infos, protocol.ProviderInfo{
@@ -543,6 +610,7 @@ func (d *Daemon) handleLock(conn net.Conn) {
 
 // Lock clears all provider credentials from memory and sets the daemon
 // to locked state. The socket remains open but returns LOCKED errors.
+// Cached tokens are dropped along with the credentials that minted them.
 func (d *Daemon) Lock() {
 	if d.locked.Load() {
 		return // Already locked
@@ -550,13 +618,59 @@ func (d *Daemon) Lock() {
 
 	slog.Info("locking daemon, clearing credentials from memory")
 
+	d.cache.clear()
+
+	d.pmu.RLock()
 	for _, p := range d.providers {
 		if err := p.Close(); err != nil {
 			slog.Error("failed to close provider during lock", "provider", p.Name(), "error", err)
 		}
 	}
+	d.pmu.RUnlock()
 
 	d.locked.Store(true)
+}
+
+// Unlock re-reads root credentials from coffer, rebuilds the provider
+// registry, and clears the locked state. It is a no-op when the daemon is
+// not locked. On failure the daemon stays locked.
+func (d *Daemon) Unlock() error {
+	if !d.locked.Load() {
+		return nil // Already unlocked
+	}
+
+	slog.Info("unlocking daemon, re-reading credentials from coffer")
+
+	if err := d.LoadProviders(); err != nil {
+		return fmt.Errorf("unlock failed: %w", err)
+	}
+
+	d.locked.Store(false)
+	d.resetIdleTimer()
+	return nil
+}
+
+// handleUnlock re-reads coffer and unlocks the daemon.
+func (d *Daemon) handleUnlock(conn net.Conn) {
+	if err := d.Unlock(); err != nil {
+		slog.Error("unlock failed", "error", err)
+		d.notifier.Send("coffer_unreadable", "Wicket: Unlock Failed",
+			fmt.Sprintf("Could not re-read coffer during unlock: %v", err))
+		writeJSON(conn, protocol.ErrorResponse{
+			Error: fmt.Sprintf("unlock failed: %v", err),
+			Code:  protocol.ErrInternalError,
+		})
+		return
+	}
+
+	d.pmu.RLock()
+	providersLoaded := len(d.providers)
+	d.pmu.RUnlock()
+
+	writeJSON(conn, protocol.UnlockResponse{
+		Status:          "unlocked",
+		ProvidersLoaded: providersLoaded,
+	})
 }
 
 // shutdown performs graceful shutdown: zero credentials, remove socket, remove PID.
@@ -581,12 +695,15 @@ func (d *Daemon) shutdown() error {
 		slog.Warn("timed out waiting for connections to close")
 	}
 
-	// Zero all credential memory
+	// Zero all credential memory and drop cached tokens
+	d.cache.clear()
+	d.pmu.RLock()
 	for _, p := range d.providers {
 		if err := p.Close(); err != nil {
 			slog.Error("failed to close provider during shutdown", "provider", p.Name(), "error", err)
 		}
 	}
+	d.pmu.RUnlock()
 
 	// Stop idle timer
 	if d.idleTimer != nil {

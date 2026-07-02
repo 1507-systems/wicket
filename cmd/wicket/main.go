@@ -246,15 +246,23 @@ func cmdLock() {
 	fmt.Fprintf(os.Stderr, "wicket: daemon locked\n")
 }
 
-// cmdUnlock is a placeholder for the unlock flow. Full implementation
-// requires coffer passphrase input or keychain-stored age identity.
+// cmdUnlock asks the daemon to re-read coffer credentials, rebuild its
+// provider registry, and clear the locked state. Decryption is delegated to
+// the coffer CLI in the daemon process; if the vault needs an interactive
+// passphrase, unlock fails and the daemon stays locked.
 func cmdUnlock() {
-	// TODO: implement unlock flow
-	// 1. Connect to daemon socket
-	// 2. Re-read coffer credentials (may prompt for passphrase)
-	// 3. Reinitialize providers
-	fmt.Fprintf(os.Stderr, "wicket: unlock not yet implemented\n")
-	os.Exit(1)
+	client := protocol.NewClient(config.DefaultSocketPath())
+	raw, err := client.SendAndCheck(&protocol.Request{Action: "unlock"})
+	if err != nil {
+		fatal("failed to unlock daemon: %v", err)
+	}
+
+	var resp protocol.UnlockResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		fatal("failed to parse unlock response: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "wicket: daemon unlocked (%d providers loaded)\n", resp.ProvidersLoaded)
 }
 
 // cmdAudit shows recent audit log entries.
