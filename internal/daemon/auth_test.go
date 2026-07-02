@@ -10,7 +10,7 @@ import (
 func TestAuthenticatePeerSameUID(t *testing.T) {
 	// Create a Unix socket pair for testing peer auth.
 	// Both sides run as the same UID, so authentication should succeed.
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	sockPath := filepath.Join(dir, "test.sock")
 
 	listener, err := net.Listen("unix", sockPath)

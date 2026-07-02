@@ -46,7 +46,7 @@ func TestResolvePeerExecutableSelf(t *testing.T) {
 // the given allowlist and returns the result over channels.
 func dialAndAuth(t *testing.T, allowed []string) (*PeerInfo, error) {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortSocketDir(t)
 	sockPath := filepath.Join(dir, "test.sock")
 
 	listener, err := net.Listen("unix", sockPath)
