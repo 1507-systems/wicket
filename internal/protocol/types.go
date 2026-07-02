@@ -7,7 +7,7 @@ import "time"
 
 // Request represents a client request sent over the Unix socket.
 type Request struct {
-	Action   string         `json:"action"`             // "get", "status", "providers", "audit", "lock"
+	Action   string         `json:"action"`             // "get", "status", "providers", "audit", "lock", "unlock"
 	Provider string         `json:"provider,omitempty"` // required for "get"
 	Scope    string         `json:"scope,omitempty"`    // required for "get"
 	Options  map[string]any `json:"options,omitempty"`  // provider-specific overrides
@@ -30,18 +30,18 @@ type ErrorResponse struct {
 
 // Error codes returned by the daemon.
 const (
-	ErrProviderNotFound     = "PROVIDER_NOT_FOUND"
-	ErrScopeNotFound        = "SCOPE_NOT_FOUND"
-	ErrTokenExchangeFailed  = "TOKEN_EXCHANGE_FAILED"
-	ErrLocked               = "LOCKED"
-	ErrUnauthorized         = "UNAUTHORIZED"
-	ErrInternalError        = "INTERNAL_ERROR"
-	ErrInvalidRequest       = "INVALID_REQUEST"
+	ErrProviderNotFound    = "PROVIDER_NOT_FOUND"
+	ErrScopeNotFound       = "SCOPE_NOT_FOUND"
+	ErrTokenExchangeFailed = "TOKEN_EXCHANGE_FAILED"
+	ErrLocked              = "LOCKED"
+	ErrUnauthorized        = "UNAUTHORIZED"
+	ErrInternalError       = "INTERNAL_ERROR"
+	ErrInvalidRequest      = "INVALID_REQUEST"
 )
 
 // StatusResponse is returned by the "status" action.
 type StatusResponse struct {
-	Status          string     `json:"status"`           // "running" or "locked"
+	Status          string     `json:"status"` // "running" or "locked"
 	Locked          bool       `json:"locked"`
 	UptimeSeconds   int64      `json:"uptime_seconds"`
 	ProvidersLoaded int        `json:"providers_loaded"`
@@ -85,4 +85,10 @@ type AuditEntry struct {
 // LockResponse is returned by the "lock" action.
 type LockResponse struct {
 	Status string `json:"status"` // "locked"
+}
+
+// UnlockResponse is returned by the "unlock" action.
+type UnlockResponse struct {
+	Status          string `json:"status"` // "unlocked"
+	ProvidersLoaded int    `json:"providers_loaded"`
 }
