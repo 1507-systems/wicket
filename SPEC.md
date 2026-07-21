@@ -195,11 +195,13 @@ All communication is newline-delimited JSON over the Unix socket. Each connectio
 
 Critical failures MUST send urgent push notifications via ntfy so the operator is alerted even when not watching logs. The daemon sends these automatically -- no external watcher required.
 
+Notifications are published to the self-hosted ntfy server (fleet policy: public ntfy.sh is retired). The self-hosted server currently accepts anonymous writes (`auth-default-access: write-only`), so no token is required today; once the fleet ntfy write-lockdown lands, a per-publisher `Authorization: Bearer` token will need to be attached (see `plan_ntfy_auth_model`).
+
 **Endpoint:**
 
 ```bash
 curl -s -H "Priority: urgent" -H "Title: Wicket Error" -H "Tags: key,warning" \
-  -d "Error description" "https://ntfy.sh/roguenode-watchdog-6ffbaa666ec3"
+  -d "Error description" "https://ntfy.1507.cloud/roguenode-watchdog-6ffbaa666ec3"
 ```
 
 **Events that trigger notifications:**

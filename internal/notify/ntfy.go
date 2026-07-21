@@ -1,6 +1,6 @@
-// Package notify sends urgent push notifications via ntfy.sh for critical
-// daemon events. Notifications are best-effort (fire-and-forget) and
-// rate-limited to avoid spam during sustained outages.
+// Package notify sends urgent push notifications via the self-hosted ntfy
+// server for critical daemon events. Notifications are best-effort
+// (fire-and-forget) and rate-limited to avoid spam during sustained outages.
 package notify
 
 import (
@@ -13,16 +13,23 @@ import (
 )
 
 const (
-	// ntfyEndpoint is the ntfy topic URL for wicket alerts.
-	ntfyEndpoint = "https://ntfy.sh/wiles-watchdog-41aa3b5cea50"
+	// ntfyEndpoint is the ntfy topic URL for wicket alerts, served by the
+	// self-hosted ntfy instance (fleet policy: public ntfy.sh is retired).
+	// The self-hosted server currently accepts anonymous writes
+	// (auth-default-access: write-only), so no token is required today.
+	//
+	// TODO(fleet ntfy write-lockdown, see plan_ntfy_auth_model): once the
+	// fleet locks down anonymous writes, attach a per-publisher
+	// "Authorization: Bearer <token>" header to the request below.
+	ntfyEndpoint = "https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
 
 	// rateLimitWindow is the minimum interval between notifications of the
 	// same event type. Prevents flooding during sustained outages.
 	rateLimitWindow = 5 * time.Minute
 )
 
-// Notifier sends urgent notifications via ntfy.sh. It rate-limits by event
-// type to avoid spam.
+// Notifier sends urgent notifications via the self-hosted ntfy server. It
+// rate-limits by event type to avoid spam.
 type Notifier struct {
 	mu       sync.Mutex
 	lastSent map[string]time.Time
@@ -74,6 +81,9 @@ func (n *Notifier) sendHTTP(title, message string) error {
 	req.Header.Set("Priority", "urgent")
 	req.Header.Set("Title", title)
 	req.Header.Set("Tags", "key,warning")
+	// TODO(fleet ntfy write-lockdown, see plan_ntfy_auth_model): once
+	// anonymous writes are disabled fleet-wide, set:
+	//   req.Header.Set("Authorization", "Bearer <per-publisher-token>")
 
 	resp, err := n.client.Do(req)
 	if err != nil {
