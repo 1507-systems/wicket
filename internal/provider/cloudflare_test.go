@@ -164,3 +164,83 @@ func TestMintDoesNotRetryWhenNothingWasReclaimable(t *testing.T) {
 		t.Errorf("mintAttempts = %d, want 1 (no pointless retry)", mintAttempts)
 	}
 }
+
+// TestTokenIsDeadHandlesCloudflareLazyStatus pins the predicate that every
+// previous cleaner in this fleet got wrong.
+//
+// Cloudflare leaves status=="active" long after expires_on passes (postmortem
+// 2026-06-03 observed 9d23h). A status-only filter therefore never reaps the
+// tokens that actually fill the quota, which is why the cap kept being hit.
+func TestTokenIsDeadHandlesCloudflareLazyStatus(t *testing.T) {
+	now := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	rfc := func(d time.Duration) string { return now.Add(d).Format(time.RFC3339) }
+
+	cases := []struct {
+		name      string
+		status    string
+		expiresOn string
+		want      bool
+		why       string
+	}{
+		{"cloudflare says expired", "expired", rfc(-time.Hour), true,
+			"the easy case every old cleaner already handled"},
+		{"THE GHOST: long past expiry but still active", "active", rfc(-240 * time.Hour), true,
+			"the actual quota filler — status lags by days, so expires_on must decide"},
+		{"just past expiry, still active", "active", rfc(-5 * time.Minute), true,
+			"past the grace period, so reclaimable"},
+		{"expired seconds ago", "active", rfc(-10 * time.Second), false,
+			"inside the grace period: a caller may still be holding it"},
+		{"live token", "active", rfc(2 * time.Hour), false,
+			"must never be touched"},
+		{"no expires_on", "active", "", false,
+			"cannot reason about it, so leave it alone"},
+		{"garbage expires_on", "active", "not-a-timestamp", false,
+			"unparseable must fail safe, not delete"},
+		{"expired status wins over garbage date", "expired", "not-a-timestamp", true,
+			"cloudflare's own verdict is authoritative"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tokenIsDead(tc.status, tc.expiresOn, now); got != tc.want {
+				t.Errorf("tokenIsDead(%q, %q) = %v, want %v — %s",
+					tc.status, tc.expiresOn, got, tc.want, tc.why)
+			}
+		})
+	}
+}
+
+// TestGroomReapsTimeExpiredGhost proves the groomer acts on a ghost end to end,
+// not just that the predicate is right in isolation.
+func TestGroomReapsTimeExpiredGhost(t *testing.T) {
+	past := time.Now().UTC().Add(-72 * time.Hour).Format(time.RFC3339)
+	future := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+
+	var deleted []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/user/tokens", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, `{"success":true,"result":[
+			{"id":"ghost","name":"wicket-cf-dns-ghost","status":"active","expires_on":%q},
+			{"id":"live","name":"wicket-cf-dns-live","status":"active","expires_on":%q},
+			{"id":"foreign","name":"ephemeral-other","status":"active","expires_on":%q}
+		]}`, past, future, past)
+	})
+	mux.HandleFunc("/user/tokens/", func(w http.ResponseWriter, r *http.Request) {
+		deleted = append(deleted, strings.TrimPrefix(r.URL.Path, "/user/tokens/"))
+		fmt.Fprint(w, `{"success":true}`)
+	})
+
+	c, _ := newCloudflareAgainst(t, mux)
+
+	pruned, err := c.groomExpiredTokens(context.Background(), "meta-token")
+	if err != nil {
+		t.Fatalf("groomExpiredTokens: %v", err)
+	}
+	if pruned != 1 {
+		t.Errorf("pruned = %d, want 1", pruned)
+	}
+	if len(deleted) != 1 || deleted[0] != "ghost" {
+		t.Errorf("deleted = %v, want [ghost] — the live wicket token and another "+
+			"tool's expired ephemeral must both survive", deleted)
+	}
+}
