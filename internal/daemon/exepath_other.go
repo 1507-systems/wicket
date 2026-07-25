@@ -10,3 +10,8 @@ import "fmt"
 func resolvePeerExecutable(pid int32) (string, error) {
 	return "", fmt.Errorf("peer executable resolution unsupported on this platform")
 }
+
+// resolveParentPID is unsupported on this platform.
+func resolveParentPID(pid int32) (int32, error) {
+	return 0, fmt.Errorf("parent PID resolution unsupported on this platform")
+}

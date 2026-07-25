@@ -17,6 +17,12 @@ type PeerInfo struct {
 	// could be resolved from PID. Empty if resolution failed or is
 	// unsupported on the platform.
 	Binary string
+
+	// ParentBinary is set only when the allowlist admitted this call on the
+	// strength of the PARENT process rather than the peer itself — i.e. the peer
+	// was the wicket CLI and the real caller was one level up. Recorded so the
+	// audit trail names the caller instead of the CLI shim.
+	ParentBinary string
 }
 
 // AuthenticatePeer extracts and verifies the identity of the connecting
@@ -56,12 +62,53 @@ func AuthenticatePeerWithBinaries(conn net.Conn, allowedBinaries []string) (*Pee
 	}
 
 	if len(allowedBinaries) > 0 {
+		// Check the peer AND its parent.
+		//
+		// Why the parent matters: the process that opens this socket is almost
+		// always the `wicket` CLI itself, so a peer-only check makes any
+		// allowlist of CALLERS (claude, a shell, curl-via-CLI) unsatisfiable —
+		// the daemon rejects everything and the broker serves nobody. That is
+		// exactly what happened on 2026-07-25: the enforcement shipped in #1,
+		// the deployed binary was old enough to ignore it, and the first real
+		// deploy attempt took the broker down.
+		//
+		// Checking both keeps two legitimate shapes working:
+		//   - a program that connects DIRECTLY (peer is that program)
+		//   - a program that execs the CLI (peer is wicket, parent is the caller)
+		//
+		// Only one level up, deliberately. Walking further would let any
+		// allowlisted ancestor launder access for an arbitrary intermediate
+		// process, which is the thing an allowlist is supposed to prevent.
 		if !binaryAllowed(peer.Binary, allowedBinaries) {
-			return nil, fmt.Errorf("peer executable %q is not in allowed_binaries", peer.Binary)
+			parentBinary, perr := resolveParentBinary(peer.PID)
+			if perr != nil {
+				return nil, fmt.Errorf("peer executable %q is not in allowed_binaries and its parent could not be resolved: %w", peer.Binary, perr)
+			}
+			if !binaryAllowed(parentBinary, allowedBinaries) {
+				return nil, fmt.Errorf("neither peer executable %q nor its parent %q is in allowed_binaries", peer.Binary, parentBinary)
+			}
+			// Record what actually authorized the call, so the audit log shows
+			// the caller rather than the CLI shim every time.
+			peer.ParentBinary = parentBinary
 		}
 	}
 
 	return peer, nil
+}
+
+// resolveParentBinary returns the executable path of pid's parent process.
+func resolveParentBinary(pid int32) (string, error) {
+	if pid <= 0 {
+		return "", fmt.Errorf("peer PID unavailable")
+	}
+	ppid, err := resolveParentPID(pid)
+	if err != nil {
+		return "", err
+	}
+	if ppid <= 0 {
+		return "", fmt.Errorf("parent PID of %d is unavailable", pid)
+	}
+	return resolvePeerExecutable(ppid)
 }
 
 // binaryAllowed reports whether exe matches any entry in allowed. An entry
