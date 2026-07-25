@@ -49,7 +49,7 @@ func DefaultPIDPath() string {
 // Config is the top-level configuration structure.
 type Config struct {
 	SocketPath      string                    `yaml:"socket_path"`
-	CofferPath     string                    `yaml:"coffer_path"`
+	CofferPath      string                    `yaml:"coffer_path"`
 	IdleTimeout     Duration                  `yaml:"idle_timeout"`
 	AuditLog        string                    `yaml:"audit_log"`
 	PIDFile         string                    `yaml:"pid_file"`
@@ -60,10 +60,10 @@ type Config struct {
 // ProviderConfig holds the type-specific configuration for a single provider.
 // Fields vary by type; unused fields for a given type are silently ignored.
 type ProviderConfig struct {
-	Type           string                    `yaml:"type"`             // "cloudflare", "github", "tailscale_oauth", "zoho_oauth", "passthrough"
-	RootCredential string                    `yaml:"root_credential"` // coffer path for the root credential
-	DefaultTTL     Duration                  `yaml:"default_ttl"`
-	Scopes         map[string]ScopeConfig    `yaml:"scopes"`
+	Type           string                 `yaml:"type"`            // "cloudflare", "github", "tailscale_oauth", "zoho_oauth", "passthrough"
+	RootCredential string                 `yaml:"root_credential"` // coffer path for the root credential
+	DefaultTTL     Duration               `yaml:"default_ttl"`
+	Scopes         map[string]ScopeConfig `yaml:"scopes"`
 
 	// GitHub-specific
 	AppID          int64  `yaml:"app_id"`

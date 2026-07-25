@@ -139,4 +139,3 @@ func (l *Logger) Close() error {
 	l.file = nil
 	return err
 }
-
