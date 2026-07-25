@@ -34,18 +34,18 @@ type ZohoScope struct {
 
 // Zoho exchanges a refresh token for OAuth access tokens.
 type Zoho struct {
-	name           string
-	clientID       string
-	clientSecret   string
-	refreshToken   string
-	refreshPath    string // coffer path for persisting rotated refresh tokens
-	domain         string // zoho.com, zoho.eu, etc.
-	config         ZohoConfig
-	cofferReader  *coffer.Reader
-	notifier       *notify.Notifier
-	client         *http.Client
-	healthy        bool
-	mu             sync.RWMutex
+	name         string
+	clientID     string
+	clientSecret string
+	refreshToken string
+	refreshPath  string // coffer path for persisting rotated refresh tokens
+	domain       string // zoho.com, zoho.eu, etc.
+	config       ZohoConfig
+	cofferReader *coffer.Reader
+	notifier     *notify.Notifier
+	client       *http.Client
+	healthy      bool
+	mu           sync.RWMutex
 }
 
 // NewZoho creates a Zoho OAuth provider.
@@ -54,17 +54,17 @@ func NewZoho(name, clientID, clientSecret, refreshToken, refreshPath, domain str
 		domain = "zoho.com"
 	}
 	return &Zoho{
-		name:          name,
-		clientID:      clientID,
-		clientSecret:  clientSecret,
-		refreshToken:  refreshToken,
-		refreshPath:   refreshPath,
-		domain:        domain,
-		config:        config,
+		name:         name,
+		clientID:     clientID,
+		clientSecret: clientSecret,
+		refreshToken: refreshToken,
+		refreshPath:  refreshPath,
+		domain:       domain,
+		config:       config,
 		cofferReader: lr,
-		notifier:      notifier,
-		client:        &http.Client{Timeout: 30 * time.Second},
-		healthy:       clientID != "" && clientSecret != "" && refreshToken != "",
+		notifier:     notifier,
+		client:       &http.Client{Timeout: 30 * time.Second},
+		healthy:      clientID != "" && clientSecret != "" && refreshToken != "",
 	}
 }
 

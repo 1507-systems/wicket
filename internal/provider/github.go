@@ -1,7 +1,7 @@
 // GitHub provider generates installation access tokens using a GitHub App's
 // private key. The flow is:
-//   1. Generate a JWT signed with the App's RSA private key
-//   2. POST to /app/installations/{id}/access_tokens to get an installation token
+//  1. Generate a JWT signed with the App's RSA private key
+//  2. POST to /app/installations/{id}/access_tokens to get an installation token
 //
 // Installation tokens are valid for 1 hour (GitHub controls the exact
 // expiration; we cannot request shorter).
