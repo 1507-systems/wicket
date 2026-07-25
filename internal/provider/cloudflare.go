@@ -234,13 +234,28 @@ func (c *Cloudflare) mintToken(ctx context.Context, metaToken string, bodyJSON [
 	return cfResp.Result.Value, nil
 }
 
-// groomExpiredTokens deletes EXPIRED tokens that wicket itself minted, and
-// returns how many it removed.
+// groomExpiredTokens deletes wicket's own dead tokens and returns how many it
+// removed.
 //
-// Deliberately conservative on two axes, because this runs unattended:
-//   - only status=="expired" — an active token may still be in a caller's hand
+// THE PREDICATE IS THE WHOLE POINT. Cloudflare does NOT set status to "expired"
+// when a token's expires_on passes — it leaves status "active" and flips the
+// field lazily, much later (postmortem 2026-06-03 observed a token still
+// "active" 9 days 23 hours past expiry). Every previous cleaner in this fleet
+// filtered on status=="expired" alone, so none of them ever saw the
+// time-expired-but-status-active tokens that actually fill the quota. That is
+// why the cap kept being hit despite repeated "fixes".
+//
+// So a token is groomable when EITHER:
+//   - status == "expired"  (Cloudflare has caught up), OR
+//   - expires_on is in the past by more than gracePeriod (it has not)
+//
+// Deliberately conservative on the other axes, because this runs unattended:
 //   - only names with the "wicket-" prefix — never a human's long-lived named
 //     token, and never another tool's ephemerals, even when expired
+//   - a grace period, so a token minted seconds ago is never reaped out from
+//     under the caller that just requested it
+//   - tokens with an unparseable or absent expires_on are LEFT ALONE unless
+//     Cloudflare itself says expired; guessing risks deleting a live credential
 //
 // A delete failure is logged and skipped rather than aborting the sweep: one
 // stubborn token must not prevent reclaiming the rest.
@@ -268,9 +283,10 @@ func (c *Cloudflare) groomExpiredTokens(ctx context.Context, metaToken string) (
 	var listResp struct {
 		Success bool `json:"success"`
 		Result  []struct {
-			ID     string `json:"id"`
-			Name   string `json:"name"`
-			Status string `json:"status"`
+			ID        string `json:"id"`
+			Name      string `json:"name"`
+			Status    string `json:"status"`
+			ExpiresOn string `json:"expires_on"`
 		} `json:"result"`
 	}
 	if err := json.Unmarshal(listBody, &listResp); err != nil {
@@ -282,7 +298,10 @@ func (c *Cloudflare) groomExpiredTokens(ctx context.Context, metaToken string) (
 
 	pruned := 0
 	for _, t := range listResp.Result {
-		if t.Status != "expired" || !strings.HasPrefix(t.Name, "wicket-") {
+		if !strings.HasPrefix(t.Name, "wicket-") {
+			continue
+		}
+		if !tokenIsDead(t.Status, t.ExpiresOn, time.Now().UTC()) {
 			continue
 		}
 		delReq, err := http.NewRequestWithContext(ctx, "DELETE", c.apiBase+"/user/tokens/"+t.ID, nil)
@@ -304,6 +323,28 @@ func (c *Cloudflare) groomExpiredTokens(ctx context.Context, metaToken string) (
 		pruned++
 	}
 	return pruned, nil
+}
+
+// groomGracePeriod keeps a just-minted token from being reaped by a concurrent
+// groom before its requester has used it.
+const groomGracePeriod = 60 * time.Second
+
+// tokenIsDead reports whether a token can be safely deleted: either Cloudflare
+// has marked it expired, or its expires_on is comfortably in the past. An
+// unparseable or empty expires_on is treated as NOT dead — deleting a token we
+// cannot reason about risks killing a live credential.
+func tokenIsDead(status, expiresOn string, now time.Time) bool {
+	if status == "expired" {
+		return true
+	}
+	if expiresOn == "" {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, expiresOn)
+	if err != nil {
+		return false
+	}
+	return exp.Add(groomGracePeriod).Before(now)
 }
 
 // Close zeros the meta-token from memory.
