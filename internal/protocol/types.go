@@ -7,7 +7,7 @@ import "time"
 
 // Request represents a client request sent over the Unix socket.
 type Request struct {
-	Action   string         `json:"action"`             // "get", "status", "providers", "audit", "lock", "unlock"
+	Action   string         `json:"action"`             // "get", "status", "providers", "audit", "lock", "unlock", "reload"
 	Provider string         `json:"provider,omitempty"` // required for "get"
 	Scope    string         `json:"scope,omitempty"`    // required for "get"
 	Options  map[string]any `json:"options,omitempty"`  // provider-specific overrides
@@ -90,5 +90,11 @@ type LockResponse struct {
 // UnlockResponse is returned by the "unlock" action.
 type UnlockResponse struct {
 	Status          string `json:"status"` // "unlocked"
+	ProvidersLoaded int    `json:"providers_loaded"`
+}
+
+// ReloadResponse is returned by the "reload" action.
+type ReloadResponse struct {
+	Status          string `json:"status"` // "reloaded"
 	ProvidersLoaded int    `json:"providers_loaded"`
 }

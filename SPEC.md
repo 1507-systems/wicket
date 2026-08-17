@@ -144,7 +144,7 @@ All communication is newline-delimited JSON over the Unix socket. Each connectio
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `action` | string | yes | One of: `get`, `status`, `providers`, `audit`, `lock` |
+| `action` | string | yes | One of: `get`, `status`, `providers`, `audit`, `lock`, `unlock`, `reload` |
 | `provider` | string | for `get` | Provider name from config |
 | `scope` | string | for `get` | Scope name within the provider |
 | `options` | object | no | Provider-specific overrides (e.g., custom TTL, zone filter) |
@@ -211,7 +211,7 @@ curl -s -H "Priority: urgent" -H "Title: Wicket Error" -H "Tags: key,warning" \
 | Daemon crash/restart | Sent on startup if a stale PID file or socket is detected (implies previous unclean exit) |
 | Repeated TOKEN_EXCHANGE_FAILED | 3+ consecutive failures for the same provider within 5 minutes (provider API likely down) |
 | Unauthorized connection attempt | Any getpeereid() UID mismatch (potential rogue process probing the socket) |
-| Coffer locked / unreadable | Daemon cannot decrypt vault on startup or after unlock attempt |
+| Coffer locked / unreadable | Daemon cannot decrypt vault on startup or after an unlock/reload attempt |
 
 Notifications are best-effort (fire-and-forget HTTP POST). A notification failure MUST NOT block daemon operation. Rate-limit to at most 1 notification per event type per 5 minutes to avoid spam during sustained outages.
 
@@ -277,6 +277,45 @@ Response: last N entries from the audit log.
 
 Immediately triggers idle-lock behavior. Responds with `{"status": "locked"}`.
 
+### Action: `unlock`
+
+```json
+{"action": "unlock"}
+```
+
+Re-reads coffer and rebuilds the provider registry, then clears the locked
+flag. **No-op if the daemon is already unlocked** — which is its normal
+steady state, since nothing routinely locks it. This means `unlock` does
+**not** pick up a `coffer set` credential rotation made while the daemon was
+already unlocked; use `reload` for that. Responds with
+`{"status": "unlocked", "providers_loaded": N}`.
+
+### Action: `reload`
+
+```json
+{"action": "reload"}
+```
+
+Re-reads coffer and rebuilds the provider registry in place, **without**
+changing the daemon's lock state, restarting the process, or dropping the
+Unix socket (other clients are unaffected). This is the operation for
+picking up a `coffer set` rotation on a credential wicket already has a
+provider for — added 2026-08-16 after `unlock`'s no-op-when-already-unlocked
+behavior (above) meant a rotated Tailscale OAuth secret kept serving stale
+until a full `wicket stop && wicket start -d`.
+
+Requires the daemon to be unlocked: if it's locked, reload returns
+`{"error": "...", "code": "LOCKED"}` rather than implicitly unlocking —
+`Lock` is a deliberate security boundary and "refresh my credentials" must
+not silently walk past it. Run `unlock` first. On success, responds with
+`{"status": "reloaded", "providers_loaded": N}`.
+
+Reload does not clear the token cache: a cached, still-live short-lived
+token remains valid regardless of whether the root credential that minted
+it was just rotated (rotating a meta-token doesn't revoke tokens already
+derived from it), so cache eviction is left to the normal per-request
+30%-TTL check rather than `lock`'s blanket clear.
+
 ---
 
 ## CLI Interface
@@ -291,6 +330,7 @@ wicket status                         # Show daemon status, loaded providers
 wicket lock                           # Immediately lock the daemon
 wicket unlock                         # Unlock daemon (reads coffer passphrase)
 wicket unlock --auto                  # Unlock using keychain-stored coffer password
+wicket reload                         # Re-read coffer for all providers in place (no-op-when-unlocked fix; requires unlocked)
 
 wicket get <provider>/<scope>         # Request a token (prints to stdout)
 wicket get cloudflare/dns             # Short-lived Cloudflare DNS token
