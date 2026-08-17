@@ -1,7 +1,7 @@
 // Package main is the CLI entry point for wicket, a credential broker daemon.
 // The wicket binary acts as both the daemon and the client. The first argument
-// determines the subcommand: start, stop, status, get, lock, unlock, audit,
-// providers, version.
+// determines the subcommand: start, stop, status, get, lock, unlock, reload,
+// audit, providers, version.
 package main
 
 import (
@@ -43,6 +43,8 @@ func main() {
 		cmdLock()
 	case "unlock":
 		cmdUnlock()
+	case "reload":
+		cmdReload()
 	case "audit":
 		cmdAudit()
 	case "providers":
@@ -67,7 +69,8 @@ Usage:
   wicket status                     Show daemon status
   wicket get <provider>/<scope>     Request a scoped token (token printed to stdout)
   wicket lock                       Immediately lock the daemon
-  wicket unlock                     Unlock the daemon (re-reads coffer)
+  wicket unlock                     Unlock the daemon (re-reads coffer if it was locked)
+  wicket reload                     Re-read coffer for all providers in place (requires unlocked)
   wicket audit [--limit N]          Show recent audit log entries
   wicket providers                  List configured providers
   wicket version                    Print version info
@@ -250,6 +253,13 @@ func cmdLock() {
 // provider registry, and clear the locked state. Decryption is delegated to
 // the coffer CLI in the daemon process; if the vault needs an interactive
 // passphrase, unlock fails and the daemon stays locked.
+//
+// NOTE: if the daemon is already unlocked (its normal steady state -- an
+// idle timeout or explicit `wicket lock` is the only thing that locks it),
+// this is a no-op: it does NOT re-read coffer. That means it will NOT pick
+// up a `coffer set` rotation made while the daemon was already unlocked.
+// Use `wicket reload` for that -- it always re-reads coffer regardless of
+// lock state (erroring out only if the daemon happens to be locked).
 func cmdUnlock() {
 	client := protocol.NewClient(config.DefaultSocketPath())
 	raw, err := client.SendAndCheck(&protocol.Request{Action: "unlock"})
@@ -263,6 +273,33 @@ func cmdUnlock() {
 	}
 
 	fmt.Fprintf(os.Stderr, "wicket: daemon unlocked (%d providers loaded)\n", resp.ProvidersLoaded)
+}
+
+// cmdReload asks the daemon to re-read every configured provider's
+// credential(s) from coffer and rebuild the provider registry in place --
+// no daemon restart, no socket drop, no other client losing its connection.
+// This is the fix for the case `wicket unlock` doesn't cover: use it after
+// `coffer set` rotates a value that wicket already has a provider for.
+//
+// Reload requires the daemon to be unlocked. If it's locked, this fails
+// with exit code 2 (same as a locked `get`); run `wicket unlock` first.
+func cmdReload() {
+	client := protocol.NewClient(config.DefaultSocketPath())
+	raw, err := client.SendAndCheck(&protocol.Request{Action: "reload"})
+	if err != nil {
+		if strings.Contains(err.Error(), protocol.ErrLocked) {
+			fmt.Fprintf(os.Stderr, "wicket: daemon is locked; run 'wicket unlock' first\n")
+			os.Exit(2)
+		}
+		fatal("failed to reload daemon: %v", err)
+	}
+
+	var resp protocol.ReloadResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		fatal("failed to parse reload response: %v", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "wicket: daemon reloaded (%d providers loaded)\n", resp.ProvidersLoaded)
 }
 
 // cmdAudit shows recent audit log entries.

@@ -8,6 +8,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -27,6 +28,14 @@ import (
 	"github.com/1507-systems/wicket/internal/protocol"
 	"github.com/1507-systems/wicket/internal/provider"
 )
+
+// ErrReloadRequiresUnlock is returned by Reload when the daemon is locked.
+// Reload deliberately does NOT implicitly unlock: Lock is a real security
+// boundary (an explicit `wicket lock`, or the idle timeout) that zeros
+// credentials from memory on purpose, and "refresh my credentials" must not
+// be a way to walk past that silently. Callers should run `wicket unlock`
+// first, then `wicket reload` if they still want to force a re-read.
+var ErrReloadRequiresUnlock = errors.New("daemon is locked; run 'wicket unlock' before reload")
 
 // Daemon is the main wicket daemon process. It manages the Unix socket
 // listener, provider registry, audit logging, and lifecycle (lock/unlock/stop).
@@ -81,9 +90,19 @@ func New(cfg *config.Config) (*Daemon, error) {
 }
 
 // LoadProviders reads root credentials from coffer and initializes all
-// configured providers. This is called on startup and after unlock.
-// Providers are built into a fresh map that replaces the old one atomically,
-// so a partial failure never leaves a half-initialized registry.
+// configured providers. This is called on startup, after unlock, and on
+// reload. Providers are built into a fresh map that replaces the old one
+// atomically, so a partial failure never leaves a half-initialized registry.
+//
+// The map being replaced is closed after the swap (best-effort; errors are
+// logged, not fatal). At startup that map is empty, so this is a no-op. On
+// unlock the outgoing map was already closed by the preceding Lock(), so
+// this is a harmless repeat (every provider's Close() is idempotent). On
+// reload -- the only caller where a *live, in-use* provider set is being
+// replaced by another live one -- this is what actually matters: it zeros
+// the just-superseded credential (e.g. the pre-rotation secret) out of the
+// old provider instance instead of leaving it as an orphaned, unreferenced,
+// un-zeroed object for the GC to eventually reclaim on its own schedule.
 func (d *Daemon) LoadProviders() error {
 	fresh := make(map[string]provider.TokenProvider, len(d.cfg.Providers))
 	for name, pcfg := range d.cfg.Providers {
@@ -101,8 +120,15 @@ func (d *Daemon) LoadProviders() error {
 	}
 
 	d.pmu.Lock()
+	previous := d.providers
 	d.providers = fresh
 	d.pmu.Unlock()
+
+	for _, p := range previous {
+		if err := p.Close(); err != nil {
+			slog.Error("failed to close superseded provider", "provider", p.Name(), "error", err)
+		}
+	}
 	return nil
 }
 
@@ -344,6 +370,8 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 		d.handleLock(conn)
 	case "unlock":
 		d.handleUnlock(conn)
+	case "reload":
+		d.handleReload(conn)
 	default:
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: fmt.Sprintf("unknown action: %q", req.Action),
@@ -669,6 +697,71 @@ func (d *Daemon) handleUnlock(conn net.Conn) {
 
 	writeJSON(conn, protocol.UnlockResponse{
 		Status:          "unlocked",
+		ProvidersLoaded: providersLoaded,
+	})
+}
+
+// Reload re-reads root credentials from coffer and rebuilds the provider
+// registry in place, without changing the daemon's lock state and without
+// touching the Unix socket or dropping any client's connection. This is the
+// fix for the case Unlock() intentionally does not cover: Unlock() is a
+// no-op when the daemon is already unlocked (see the "already unlocked"
+// branch above), which is the daemon's normal steady state -- nothing
+// routinely locks it. So rotating a credential with `coffer set` and then
+// running `wicket unlock` did NOT pick up the new value; only a full
+// `wicket stop && wicket start -d` did, because startup unconditionally
+// calls LoadProviders. Reload is the explicit, always-re-reads operation
+// for that case.
+//
+// Reload requires the daemon to already be unlocked -- see
+// ErrReloadRequiresUnlock. It does not touch the token cache: a cached,
+// still-live short-lived token remains valid regardless of whether the root
+// credential that minted it was just rotated (rotating a meta-token doesn't
+// revoke tokens already derived from it), so unlike Lock -- which exists to
+// remove root credentials from memory entirely, cache included -- reload
+// leaves cache eviction to the normal per-request TTL check.
+func (d *Daemon) Reload() error {
+	if d.locked.Load() {
+		return ErrReloadRequiresUnlock
+	}
+
+	slog.Info("reloading credentials from coffer")
+
+	if err := d.LoadProviders(); err != nil {
+		return fmt.Errorf("reload failed: %w", err)
+	}
+
+	return nil
+}
+
+// handleReload re-reads coffer and rebuilds the provider registry without
+// changing the daemon's lock state.
+func (d *Daemon) handleReload(conn net.Conn) {
+	if err := d.Reload(); err != nil {
+		if errors.Is(err, ErrReloadRequiresUnlock) {
+			writeJSON(conn, protocol.ErrorResponse{
+				Error: err.Error(),
+				Code:  protocol.ErrLocked,
+			})
+			return
+		}
+
+		slog.Error("reload failed", "error", err)
+		d.notifier.Send("coffer_unreadable", "Wicket: Reload Failed",
+			fmt.Sprintf("Could not re-read coffer during reload: %v", err))
+		writeJSON(conn, protocol.ErrorResponse{
+			Error: fmt.Sprintf("reload failed: %v", err),
+			Code:  protocol.ErrInternalError,
+		})
+		return
+	}
+
+	d.pmu.RLock()
+	providersLoaded := len(d.providers)
+	d.pmu.RUnlock()
+
+	writeJSON(conn, protocol.ReloadResponse{
+		Status:          "reloaded",
 		ProvidersLoaded: providersLoaded,
 	})
 }
