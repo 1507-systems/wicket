@@ -15,9 +15,25 @@
 # `make check-deployed` answers "is what's running actually current?" — run it
 # whenever wicket behaves in a way the source says it shouldn't.
 
+# DEPLOY TARGET (corrected 2026-09-03)
+# -----------------------------------
+# INSTALL_DIR used to be $(HOME)/.local/bin, which is NOT what runs. The
+# LaunchDaemon /Library/LaunchDaemons/com.1507.wicket.plist executes
+# /usr/local/bin/wicket, so installing to ~/.local/bin updated a binary nothing
+# started. On 2026-09-03 the two paths held DIFFERENT builds (~/.local/bin from
+# Aug 15, /usr/local/bin from Aug 16) and, because ~/.local/bin comes FIRST on
+# the interactive PATH, `wicket` in a login shell was a different binary from
+# the one the daemon was running. That is how six merged PRs (#4-#9, including a
+# security fix and two Cloudflare token-cap fixes) sat undeployed for weeks.
+#
+# /usr/local/bin is rogue:staff and group-writable here, so no sudo is needed.
+# ~/.local/bin/wicket is kept as a SYMLINK to the installed binary so there is
+# exactly one artifact and the two PATH entries can never diverge again.
 BINARY      := wicket
-INSTALL_DIR := $(HOME)/.local/bin
+INSTALL_DIR := /usr/local/bin
 INSTALLED   := $(INSTALL_DIR)/$(BINARY)
+LEGACY_LINK := $(HOME)/.local/bin/$(BINARY)
+DAEMON_LABEL := com.1507.wicket
 BUILD_OUT   := ./$(BINARY)
 # Any scope is fine here; this only has to prove the daemon answers and can mint.
 VERIFY_SCOPE := cloudflare/d1-read
@@ -48,22 +64,22 @@ install: fmt vet test build
 	else \
 		echo "    none installed yet"; \
 	fi; \
-	echo "==> stopping daemon"; \
-	$(BINARY) stop 2>/dev/null || echo "    (not running)"; \
 	echo "==> installing $(BUILD_OUT) -> $(INSTALLED)"; \
 	mkdir -p "$(INSTALL_DIR)"; \
 	cp "$(BUILD_OUT)" "$(INSTALLED)"; \
 	chmod +x "$(INSTALLED)"; \
-	echo "==> starting daemon"; \
-	"$(INSTALLED)" start -d; \
-	sleep 3; \
+	echo "==> pointing $(LEGACY_LINK) at the installed binary"; \
+	mkdir -p "$(dir $(LEGACY_LINK))"; \
+	ln -sfn "$(INSTALLED)" "$(LEGACY_LINK)"; \
+	echo "==> restarting daemon"; \
+	$(MAKE) --no-print-directory restart; \
 	echo "==> verifying"; \
 	if ! "$(INSTALLED)" status >/dev/null 2>&1; then \
 		echo "FAILED: daemon does not answer status. Rolling back."; \
 		latest=$$(ls -t /tmp/wicket-rollback-* 2>/dev/null | head -1); \
 		if [ -n "$$latest" ]; then \
-			"$(INSTALLED)" stop 2>/dev/null || true; \
-			cp "$$latest" "$(INSTALLED)"; "$(INSTALLED)" start -d; \
+			cp "$$latest" "$(INSTALLED)"; \
+			$(MAKE) --no-print-directory restart; \
 			echo "rolled back to $$latest"; \
 		fi; \
 		exit 1; \
@@ -72,8 +88,8 @@ install: fmt vet test build
 		echo "FAILED: daemon answers but cannot mint ($(VERIFY_SCOPE)). Rolling back."; \
 		latest=$$(ls -t /tmp/wicket-rollback-* 2>/dev/null | head -1); \
 		if [ -n "$$latest" ]; then \
-			"$(INSTALLED)" stop 2>/dev/null || true; \
-			cp "$$latest" "$(INSTALLED)"; "$(INSTALLED)" start -d; \
+			cp "$$latest" "$(INSTALLED)"; \
+			$(MAKE) --no-print-directory restart; \
 			echo "rolled back to $$latest"; \
 		fi; \
 		exit 1; \
@@ -95,5 +111,41 @@ check-deployed: build
 		exit 1; \
 	fi
 
+# Restart the daemon the way it is actually supervised.
+#
+# wicket runs as LaunchDaemon $(DAEMON_LABEL) with KeepAlive=1, so `stop` is
+# enough: launchd notices the exit and restarts it within seconds, loading
+# providers from the vault afresh. The old `stop; start -d` raced launchd's
+# managed instance, which could leave a second, unsupervised daemon holding the
+# socket. Poll for readiness rather than sleeping a fixed 2s.
+#
+# `wicket status` writes to STDERR, not stdout, so the grep needs 2>&1. A check
+# written with 2>/dev/null silently sees nothing and reports a healthy daemon as
+# locked.
 restart:
-	@$(BINARY) stop 2>/dev/null || true; $(BINARY) start -d; sleep 2; $(BINARY) status
+	@set -e; \
+	pid=$$(pgrep -x -f '$(INSTALLED) start' 2>/dev/null | head -1); \
+	"$(INSTALLED)" stop 2>/dev/null || true; \
+	if launchctl print system/$(DAEMON_LABEL) >/dev/null 2>&1; then \
+		echo "    (launchd-supervised: $(DAEMON_LABEL))"; \
+		for i in 1 2 3 4 5; do \
+			if [ -z "$$pid" ] || ! kill -0 "$$pid" 2>/dev/null; then break; fi; \
+			sleep 1; \
+		done; \
+		if [ -n "$$pid" ] && kill -0 "$$pid" 2>/dev/null; then \
+			echo "    'stop' left pid $$pid alive (socket closed, process lingering)"; \
+			echo "    -> killing it so KeepAlive restarts the daemon"; \
+			kill "$$pid" 2>/dev/null || true; \
+		fi; \
+	else \
+		echo "    (not launchd-supervised: starting manually)"; \
+		"$(INSTALLED)" start -d; \
+	fi; \
+	for i in $$(seq 1 30); do \
+		if "$(INSTALLED)" status 2>&1 | grep -q '^Locked:'; then break; fi; \
+		sleep 1; \
+	done; \
+	if ! "$(INSTALLED)" status 2>&1 | grep -q '^Locked:'; then \
+		echo "FAILED: daemon did not come back within 30s"; exit 1; \
+	fi; \
+	"$(INSTALLED)" status 2>&1 | head -4
