@@ -195,13 +195,22 @@ All communication is newline-delimited JSON over the Unix socket. Each connectio
 
 Critical failures MUST send urgent push notifications via ntfy so the operator is alerted even when not watching logs. The daemon sends these automatically -- no external watcher required.
 
-Notifications are published to the self-hosted ntfy server (fleet policy: public ntfy.sh is retired). The self-hosted server currently accepts anonymous writes (`auth-default-access: write-only`), so no token is required today; once the fleet ntfy write-lockdown lands, a per-publisher `Authorization: Bearer` token will need to be attached (see `plan_ntfy_auth_model`).
+**The topic URL is deployment configuration and MUST NOT appear in this repository.** An ntfy topic is a bearer-style capability: whoever knows the URL can subscribe to every alert, and on a server that permits anonymous writes can publish forged ones. Wicket therefore ships with no endpoint baked in.
 
-**Endpoint:**
+**Endpoint configuration:**
+
+| Source | Key | Precedence |
+|--------|-----|------------|
+| Environment | `WICKET_NTFY_TOPIC` | wins |
+| Config file | `ntfy_topic` | fallback |
+| Neither set | — | notifications disabled, logged at startup |
+
+`WICKET_NTFY_TOKEN`, when set, is attached as `Authorization: Bearer` for servers that require an authenticated publish. Unset means an anonymous publish.
 
 ```bash
+# Shape of the request wicket issues (URL supplied at runtime, never committed):
 curl -s -H "Priority: urgent" -H "Title: Wicket Error" -H "Tags: key,warning" \
-  -d "Error description" "https://ntfy.1507.cloud/roguenode-watchdog-6ffbaa666ec3"
+  -d "Error description" "$WICKET_NTFY_TOPIC"
 ```
 
 **Events that trigger notifications:**
@@ -579,6 +588,12 @@ idle_timeout: 0  # headless: never auto-lock
 
 # Audit log location
 audit_log: ~/.config/wicket/audit.log
+
+# Optional: ntfy topic URL for urgent failure alerts. Left empty here on
+# purpose -- the topic is a capability URL and belongs to the deployment's
+# own config file, never to this repository. WICKET_NTFY_TOPIC overrides it.
+# With both empty, wicket logs failures but sends no push notifications.
+ntfy_topic: ""
 
 # Optional: restrict connecting binaries by absolute executable path.
 # The peer's executable is resolved from its PID (macOS: proc_pidpath via

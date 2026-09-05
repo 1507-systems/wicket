@@ -48,13 +48,18 @@ func DefaultPIDPath() string {
 
 // Config is the top-level configuration structure.
 type Config struct {
-	SocketPath      string                    `yaml:"socket_path"`
-	CofferPath      string                    `yaml:"coffer_path"`
-	IdleTimeout     Duration                  `yaml:"idle_timeout"`
-	AuditLog        string                    `yaml:"audit_log"`
-	PIDFile         string                    `yaml:"pid_file"`
-	AllowedBinaries []string                  `yaml:"allowed_binaries"`
-	Providers       map[string]ProviderConfig `yaml:"providers"`
+	SocketPath      string   `yaml:"socket_path"`
+	CofferPath      string   `yaml:"coffer_path"`
+	IdleTimeout     Duration `yaml:"idle_timeout"`
+	AuditLog        string   `yaml:"audit_log"`
+	PIDFile         string   `yaml:"pid_file"`
+	AllowedBinaries []string `yaml:"allowed_binaries"`
+	// NtfyTopic is the ntfy topic URL for urgent failure alerts. Optional and
+	// deliberately absent from any committed config: the topic is a
+	// bearer-style capability, so it belongs to the deployment, not the repo.
+	// WICKET_NTFY_TOPIC overrides it; when both are empty, alerts are off.
+	NtfyTopic string                    `yaml:"ntfy_topic"`
+	Providers map[string]ProviderConfig `yaml:"providers"`
 }
 
 // ProviderConfig holds the type-specific configuration for a single provider.

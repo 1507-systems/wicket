@@ -79,7 +79,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 		providers: make(map[string]provider.TokenProvider),
 		coffer:    coffer.NewReader(cfg.CofferPath),
 		auditor:   auditor,
-		notifier:  notify.NewNotifier(),
+		notifier:  notify.NewNotifier(cfg.NtfyTopic),
 		cache:     newTokenCache(),
 		startTime: time.Now(),
 		ctx:       ctx,

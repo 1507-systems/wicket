@@ -1,56 +1,81 @@
-// Package notify sends urgent push notifications via the self-hosted ntfy
-// server for critical daemon events. Notifications are best-effort
-// (fire-and-forget) and rate-limited to avoid spam during sustained outages.
+// Package notify sends urgent push notifications via an ntfy server for
+// critical daemon events. Notifications are best-effort (fire-and-forget)
+// and rate-limited to avoid spam during sustained outages.
 package notify
 
 import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 )
 
 const (
-	// ntfyEndpoint is the ntfy topic URL for wicket alerts, served by the
-	// self-hosted ntfy instance (fleet policy: public ntfy.sh is retired).
-	// The self-hosted server currently accepts anonymous writes
-	// (auth-default-access: write-only), so no token is required today.
+	// EndpointEnv names the environment variable that supplies the ntfy topic
+	// URL. It overrides the `ntfy_topic` value in the daemon config file.
 	//
-	// TODO(fleet ntfy write-lockdown, see plan_ntfy_auth_model): once the
-	// fleet locks down anonymous writes, attach a per-publisher
-	// "Authorization: Bearer <token>" header to the request below.
-	ntfyEndpoint = "https://ntfy.1507.cloud/wiles-watchdog-41aa3b5cea50"
+	// The topic URL is deployment data, not source: an ntfy topic is a
+	// bearer-style capability (anyone who knows it can read and, on a server
+	// that allows anonymous writes, publish), so it never ships in this repo.
+	// Unset here and unset in config means notifications are disabled.
+	EndpointEnv = "WICKET_NTFY_TOPIC"
 
 	// rateLimitWindow is the minimum interval between notifications of the
 	// same event type. Prevents flooding during sustained outages.
 	rateLimitWindow = 5 * time.Minute
 )
 
-// Notifier sends urgent notifications via the self-hosted ntfy server. It
-// rate-limits by event type to avoid spam.
+// Notifier sends urgent notifications via an ntfy server. It rate-limits by
+// event type to avoid spam. A Notifier with no endpoint is inert.
 type Notifier struct {
 	mu       sync.Mutex
 	lastSent map[string]time.Time
 	client   *http.Client
+	endpoint string
+	// authToken is attached as a bearer token when the ntfy server requires
+	// authenticated publishes. Empty means anonymous publish.
+	authToken string
 }
 
-// NewNotifier creates a new ntfy notifier.
-func NewNotifier() *Notifier {
+// NewNotifier creates a new ntfy notifier. endpoint is the configured topic
+// URL; the WICKET_NTFY_TOPIC environment variable overrides it. When neither
+// is set the notifier is disabled and Send is a no-op, which is logged once
+// per event type so a silent alerting path is still visible in the log.
+func NewNotifier(endpoint string) *Notifier {
+	if env := strings.TrimSpace(os.Getenv(EndpointEnv)); env != "" {
+		endpoint = env
+	}
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		slog.Warn("ntfy notifications disabled: no topic configured",
+			"env", EndpointEnv, "config_key", "ntfy_topic")
+	}
 	return &Notifier{
-		lastSent: make(map[string]time.Time),
+		lastSent:  make(map[string]time.Time),
+		endpoint:  endpoint,
+		authToken: strings.TrimSpace(os.Getenv("WICKET_NTFY_TOKEN")),
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 	}
 }
 
+// Enabled reports whether a topic is configured.
+func (n *Notifier) Enabled() bool { return n.endpoint != "" }
+
 // Send sends an urgent notification via ntfy. The eventType is used for
 // rate limiting (only one notification per event type per 5 minutes).
 // This is fire-and-forget: a notification failure never blocks daemon
 // operation.
 func (n *Notifier) Send(eventType, title, message string) {
+	if !n.Enabled() {
+		slog.Debug("ntfy notification dropped: no topic configured", "event_type", eventType)
+		return
+	}
+
 	n.mu.Lock()
 	if last, ok := n.lastSent[eventType]; ok {
 		if time.Since(last) < rateLimitWindow {
@@ -73,7 +98,7 @@ func (n *Notifier) Send(eventType, title, message string) {
 
 // sendHTTP performs the actual HTTP POST to ntfy.
 func (n *Notifier) sendHTTP(title, message string) error {
-	req, err := http.NewRequest("POST", ntfyEndpoint, strings.NewReader(message))
+	req, err := http.NewRequest("POST", n.endpoint, strings.NewReader(message))
 	if err != nil {
 		return fmt.Errorf("failed to create ntfy request: %w", err)
 	}
@@ -81,9 +106,9 @@ func (n *Notifier) sendHTTP(title, message string) error {
 	req.Header.Set("Priority", "urgent")
 	req.Header.Set("Title", title)
 	req.Header.Set("Tags", "key,warning")
-	// TODO(fleet ntfy write-lockdown, see plan_ntfy_auth_model): once
-	// anonymous writes are disabled fleet-wide, set:
-	//   req.Header.Set("Authorization", "Bearer <per-publisher-token>")
+	if n.authToken != "" {
+		req.Header.Set("Authorization", "Bearer "+n.authToken)
+	}
 
 	resp, err := n.client.Do(req)
 	if err != nil {
