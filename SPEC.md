@@ -765,7 +765,7 @@ A custom slash command (`/get-token cloudflare/dns`) that wraps the CLI call.
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/bryce</string>
+        <string>/Users/YOUR-USERNAME</string>
     </dict>
 </dict>
 </plist>
