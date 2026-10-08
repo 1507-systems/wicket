@@ -47,3 +47,23 @@ func TestParseProviderScope(t *testing.T) {
 		})
 	}
 }
+
+func TestWantsHelp(t *testing.T) {
+	cases := []struct {
+		args []string
+		want bool
+	}{
+		{nil, false},
+		{[]string{"github-gh-cli/token"}, false},
+		{[]string{"--limit", "5"}, false},
+		{[]string{"--help"}, true},
+		{[]string{"-h"}, true},
+		{[]string{"help"}, true},
+		{[]string{"-d", "--help"}, true},
+	}
+	for _, c := range cases {
+		if got := wantsHelp(c.args); got != c.want {
+			t.Errorf("wantsHelp(%q) = %v, want %v", c.args, got, c.want)
+		}
+	}
+}

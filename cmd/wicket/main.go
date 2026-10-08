@@ -30,6 +30,13 @@ func main() {
 
 	subcmd := os.Args[1]
 
+	// `wicket <cmd> --help` must print help and change nothing. Before this,
+	// subcommands ignored the flag, so `wicket unlock --help` really unlocked.
+	if wantsHelp(os.Args[2:]) {
+		printUsage()
+		return
+	}
+
 	switch subcmd {
 	case "start":
 		cmdStart()
@@ -60,6 +67,16 @@ func main() {
 	}
 }
 
+// wantsHelp reports whether any argument after the subcommand asks for help.
+func wantsHelp(args []string) bool {
+	for _, a := range args {
+		if a == "-h" || a == "--help" || a == "help" {
+			return true
+		}
+	}
+	return false
+}
+
 func printUsage() {
 	fmt.Fprintf(os.Stderr, `wicket -- local credential broker daemon
 
@@ -74,7 +91,7 @@ Usage:
   wicket audit [--limit N]          Show recent audit log entries
   wicket providers                  List configured providers
   wicket version                    Print version info
-  wicket help                       Show this help
+  wicket help                       Show this help (so does <command> --help or -h)
 
 Exit codes:
   0  success
