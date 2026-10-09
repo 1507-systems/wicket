@@ -15,6 +15,9 @@
 # `make check-deployed` answers "is what's running actually current?" — run it
 # whenever wicket behaves in a way the source says it shouldn't.
 
+BINARY       := wicket
+DAEMON_LABEL := com.1507.wicket
+
 # DEPLOY TARGET (corrected 2026-09-03)
 # -----------------------------------
 # INSTALL_DIR used to be $(HOME)/.local/bin, which is NOT what runs. The
@@ -26,19 +29,48 @@
 # the one the daemon was running. That is how six merged PRs (#4-#9, including a
 # security fix and two Cloudflare token-cap fixes) sat undeployed for weeks.
 #
-# /usr/local/bin is rogue:staff and group-writable here, so no sudo is needed.
-# ~/.local/bin/wicket is kept as a SYMLINK to the installed binary so there is
-# exactly one artifact and the two PATH entries can never diverge again.
-BINARY      := wicket
-INSTALL_DIR := /usr/local/bin
+# HOST CLASSES (2026-10-08)
+# -------------------------
+# Wicket runs two ways, on purpose, and `make install` detects which from what
+# launchd has loaded, so there is one install command for every machine:
+#
+#   server       headless box (Wiles). Must start at boot with nobody logged in,
+#                so it is the system LaunchDaemon system/$(DAEMON_LABEL) running
+#                /usr/local/bin/wicket. /usr/local/bin is rogue:staff and
+#                group-writable there, so no sudo is needed. ~/.local/bin/wicket
+#                is kept as a SYMLINK to it so the two PATH entries never diverge.
+#   workstation  machine a person logs into (Verve). Runs as the user
+#                LaunchAgent gui/<uid>/$(DAEMON_LABEL) executing
+#                ~/.local/bin/wicket (a real file). /usr/local/bin is root-owned
+#                there, and putting wicket in it would make every upgrade need
+#                an admin password, which agents cannot supply.
+#
+# The split is recorded in provisioning ai/EXCEPTIONS.md. Neither loaded means
+# a fresh or broken machine: install refuses rather than guess; force a class
+# with `make install HOST_CLASS=server|workstation` after loading the plist.
+GUI_TARGET    := gui/$(shell id -u)/$(DAEMON_LABEL)
+SYSTEM_TARGET := system/$(DAEMON_LABEL)
+HOST_CLASS ?= $(shell if launchctl print $(SYSTEM_TARGET) >/dev/null 2>&1; then echo server; \
+	elif launchctl print $(GUI_TARGET) >/dev/null 2>&1; then echo workstation; else echo unknown; fi)
+ifeq ($(HOST_CLASS),server)
+INSTALL_DIR    := /usr/local/bin
+LEGACY_LINK    := $(HOME)/.local/bin/$(BINARY)
+LAUNCHD_TARGET := $(SYSTEM_TARGET)
+else
+INSTALL_DIR    := $(HOME)/.local/bin
+LEGACY_LINK    :=
+LAUNCHD_TARGET := $(GUI_TARGET)
+endif
 INSTALLED   := $(INSTALL_DIR)/$(BINARY)
-LEGACY_LINK := $(HOME)/.local/bin/$(BINARY)
-DAEMON_LABEL := com.1507.wicket
 BUILD_OUT   := ./$(BINARY)
 # Any scope is fine here; this only has to prove the daemon answers and can mint.
 VERIFY_SCOPE := cloudflare/d1-read
 
-.PHONY: build test vet fmt install check-deployed restart uninstall-check
+.PHONY: build test vet fmt install check-deployed restart uninstall-check host-class
+
+# Print what install would do on this machine, without doing it.
+host-class:
+	@echo "$(HOST_CLASS): $(LAUNCHD_TARGET) -> $(INSTALLED)$(if $(LEGACY_LINK), (+ symlink $(LEGACY_LINK)),)"
 
 build:
 	go build -o $(BUILD_OUT) ./cmd/wicket
@@ -57,6 +89,11 @@ fmt:
 # Full gate. Never install something that does not build, test, vet and format.
 install: fmt vet test build
 	@set -e; \
+	case "$(HOST_CLASS)" in server|workstation) ;; \
+	*) echo "REFUSED: host class is $(HOST_CLASS): neither $(SYSTEM_TARGET) nor $(GUI_TARGET) is loaded."; \
+	   echo "  Load the host's plist from provisioning first, or pass HOST_CLASS=server|workstation."; exit 1 ;; esac; \
+	echo "==> host class: $(HOST_CLASS) ($(LAUNCHD_TARGET) -> $(INSTALLED))"; \
+	if [ -L "$(INSTALLED)" ]; then echo "REFUSED: $(INSTALLED) is a symlink; this host's layout is not what $(HOST_CLASS) expects"; exit 1; fi; \
 	echo "==> backing up the current binary (rollback path)"; \
 	if [ -f "$(INSTALLED)" ]; then \
 		cp "$(INSTALLED)" "/tmp/wicket-rollback-$$(date +%s)"; \
@@ -66,11 +103,14 @@ install: fmt vet test build
 	fi; \
 	echo "==> installing $(BUILD_OUT) -> $(INSTALLED)"; \
 	mkdir -p "$(INSTALL_DIR)"; \
-	cp "$(BUILD_OUT)" "$(INSTALLED)"; \
-	chmod +x "$(INSTALLED)"; \
-	echo "==> pointing $(LEGACY_LINK) at the installed binary"; \
-	mkdir -p "$(dir $(LEGACY_LINK))"; \
-	ln -sfn "$(INSTALLED)" "$(LEGACY_LINK)"; \
+	cp "$(BUILD_OUT)" "$(INSTALLED).new"; \
+	chmod +x "$(INSTALLED).new"; \
+	mv -f "$(INSTALLED).new" "$(INSTALLED)"; \
+	if [ -n "$(LEGACY_LINK)" ]; then \
+		echo "==> pointing $(LEGACY_LINK) at the installed binary"; \
+		mkdir -p "$(dir $(LEGACY_LINK))"; \
+		ln -sfn "$(INSTALLED)" "$(LEGACY_LINK)"; \
+	fi; \
 	echo "==> restarting daemon"; \
 	$(MAKE) --no-print-directory restart; \
 	echo "==> verifying"; \
@@ -78,7 +118,7 @@ install: fmt vet test build
 		echo "FAILED: daemon does not answer status. Rolling back."; \
 		latest=$$(ls -t /tmp/wicket-rollback-* 2>/dev/null | head -1); \
 		if [ -n "$$latest" ]; then \
-			cp "$$latest" "$(INSTALLED)"; \
+			cp "$$latest" "$(INSTALLED).new" && mv -f "$(INSTALLED).new" "$(INSTALLED)"; \
 			$(MAKE) --no-print-directory restart; \
 			echo "rolled back to $$latest"; \
 		fi; \
@@ -88,7 +128,7 @@ install: fmt vet test build
 		echo "FAILED: daemon answers but cannot mint ($(VERIFY_SCOPE)). Rolling back."; \
 		latest=$$(ls -t /tmp/wicket-rollback-* 2>/dev/null | head -1); \
 		if [ -n "$$latest" ]; then \
-			cp "$$latest" "$(INSTALLED)"; \
+			cp "$$latest" "$(INSTALLED).new" && mv -f "$(INSTALLED).new" "$(INSTALLED)"; \
 			$(MAKE) --no-print-directory restart; \
 			echo "rolled back to $$latest"; \
 		fi; \
@@ -113,7 +153,7 @@ check-deployed: build
 
 # Restart the daemon the way it is actually supervised.
 #
-# wicket runs as LaunchDaemon $(DAEMON_LABEL) with KeepAlive=1, so `stop` is
+# wicket runs as launchd job $(LAUNCHD_TARGET) with KeepAlive=1, so `stop` is
 # enough: launchd notices the exit and restarts it within seconds, loading
 # providers from the vault afresh. The old `stop; start -d` raced launchd's
 # managed instance, which could leave a second, unsupervised daemon holding the
@@ -126,8 +166,8 @@ restart:
 	@set -e; \
 	pid=$$(pgrep -x -f '$(INSTALLED) start' 2>/dev/null | head -1); \
 	"$(INSTALLED)" stop 2>/dev/null || true; \
-	if launchctl print system/$(DAEMON_LABEL) >/dev/null 2>&1; then \
-		echo "    (launchd-supervised: $(DAEMON_LABEL))"; \
+	if launchctl print $(LAUNCHD_TARGET) >/dev/null 2>&1; then \
+		echo "    (launchd-supervised: $(LAUNCHD_TARGET))"; \
 		for i in 1 2 3 4 5; do \
 			if [ -z "$$pid" ] || ! kill -0 "$$pid" 2>/dev/null; then break; fi; \
 			sleep 1; \
