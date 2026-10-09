@@ -1,6 +1,15 @@
 <!-- summary: Local credential broker daemon — exchanges root secrets from Coffer for short-lived scoped tokens via Unix socket. -->
 # Wicket -- Project Log
 
+## 2026-10-08
+
+### `make install` detects the host class
+
+- Wicket deliberately runs two ways: **server** (Wiles: system LaunchDaemon `system/com.1507.wicket`, `/usr/local/bin/wicket`, `~/.local/bin/wicket` symlinked to it) and **workstation** (Verve: user LaunchAgent `gui/<uid>/com.1507.wicket`, `~/.local/bin/wicket` as a real file). The Makefile assumed server, so `make install` failed on Verve with `cp: /usr/local/bin/wicket: Permission denied`.
+- `HOST_CLASS` is now detected from whichever launchd job is loaded (override with `HOST_CLASS=server|workstation`). Install refuses when neither is loaded, or when the target path is a symlink. `make host-class` prints the plan.
+- The binary swap (and rollback) is now copy-to-`.new` then `mv`, so the running executable's inode is never overwritten in place.
+- Gotcha found while testing: `make -n install` is NOT a dry run here. The recipe contains `$(MAKE)`, so make executes it. Use `make host-class`.
+
 ## 2026-04-07
 
 ### Project Created
