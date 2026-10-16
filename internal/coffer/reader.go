@@ -4,10 +4,21 @@
 package coffer
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 )
+
+// ErrNotFound marks a Get for a path that has no entry in the vault (as
+// opposed to a vault that cannot be read or decrypted).
+var ErrNotFound = errors.New("coffer: entry not found")
+
+// isNotFound reports whether coffer's stderr says the entry does not exist.
+// coffer (via sops) prints "component ['<key>'] not found" for a missing key.
+func isNotFound(stderr string) bool {
+	return strings.Contains(stderr, "] not found")
+}
 
 // Reader reads secrets from a coffer vault by shelling out to the coffer CLI.
 type Reader struct {
@@ -40,6 +51,9 @@ func (r *Reader) Get(path string) (string, error) {
 	output, err := cmd.Output()
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			if isNotFound(string(exitErr.Stderr)) {
+				return "", fmt.Errorf("coffer get %q: %w", path, ErrNotFound)
+			}
 			return "", fmt.Errorf("coffer get %q failed: %s (stderr: %s)", path, err, string(exitErr.Stderr))
 		}
 		return "", fmt.Errorf("coffer get %q failed: %w", path, err)
