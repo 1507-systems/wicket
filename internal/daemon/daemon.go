@@ -107,6 +107,14 @@ func (d *Daemon) LoadProviders() error {
 	fresh := make(map[string]provider.TokenProvider, len(d.cfg.Providers))
 	for name, pcfg := range d.cfg.Providers {
 		p, err := d.initProvider(name, pcfg)
+		if errors.Is(err, coffer.ErrNotFound) {
+			// A provider whose credential is not in the vault yet (e.g. a new
+			// provider rendered before its operator-run setup) fails closed on
+			// its own: it is left out, so a get for it returns unknown
+			// provider. It must not take every other provider down with it.
+			slog.Error("skipping provider: credential not in coffer", "name", name, "type", pcfg.Type, "error", err)
+			continue
+		}
 		if err != nil {
 			// Zero whatever credentials were already loaded into the
 			// abandoned map before bailing out.
