@@ -15,6 +15,12 @@ type Client struct {
 	Timeout    time.Duration
 }
 
+// LoadTimeout is the client timeout for requests that make the daemon load
+// every provider (reload, unlock). Loading reads each credential from coffer
+// in turn, which took ~12s for 91 providers on Verve (2026-10-15), well past
+// the 5s default. It matches the daemon's 30s per-connection deadline.
+const LoadTimeout = 30 * time.Second
+
 // NewClient creates a client that connects to the given socket path.
 func NewClient(socketPath string) *Client {
 	return &Client{

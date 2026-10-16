@@ -279,6 +279,7 @@ func cmdLock() {
 // lock state (erroring out only if the daemon happens to be locked).
 func cmdUnlock() {
 	client := protocol.NewClient(config.DefaultSocketPath())
+	client.Timeout = protocol.LoadTimeout
 	raw, err := client.SendAndCheck(&protocol.Request{Action: "unlock"})
 	if err != nil {
 		fatal("failed to unlock daemon: %v", err)
@@ -302,6 +303,7 @@ func cmdUnlock() {
 // with exit code 2 (same as a locked `get`); run `wicket unlock` first.
 func cmdReload() {
 	client := protocol.NewClient(config.DefaultSocketPath())
+	client.Timeout = protocol.LoadTimeout
 	raw, err := client.SendAndCheck(&protocol.Request{Action: "reload"})
 	if err != nil {
 		if strings.Contains(err.Error(), protocol.ErrLocked) {
