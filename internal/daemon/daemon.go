@@ -688,6 +688,8 @@ func (d *Daemon) Unlock() error {
 
 // handleUnlock re-reads coffer and unlocks the daemon.
 func (d *Daemon) handleUnlock(conn net.Conn) {
+	// Loading every provider can outlast the 30s request deadline.
+	conn.SetDeadline(time.Now().Add(protocol.LoadTimeout))
 	if err := d.Unlock(); err != nil {
 		slog.Error("unlock failed", "error", err)
 		d.notifier.Send("coffer_unreadable", "Wicket: Unlock Failed",
@@ -745,6 +747,8 @@ func (d *Daemon) Reload() error {
 // handleReload re-reads coffer and rebuilds the provider registry without
 // changing the daemon's lock state.
 func (d *Daemon) handleReload(conn net.Conn) {
+	// Loading every provider can outlast the 30s request deadline.
+	conn.SetDeadline(time.Now().Add(protocol.LoadTimeout))
 	if err := d.Reload(); err != nil {
 		if errors.Is(err, ErrReloadRequiresUnlock) {
 			writeJSON(conn, protocol.ErrorResponse{
