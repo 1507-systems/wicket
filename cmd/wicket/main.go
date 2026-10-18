@@ -156,13 +156,10 @@ func cmdStart() {
 		fatal("failed to create daemon: %v", err)
 	}
 
-	// Load providers (reads credentials from coffer)
-	if err := d.LoadProviders(); err != nil {
-		fatal("failed to load providers: %v", err)
-	}
-
-	// Run blocks until shutdown
-	if err := d.Run(); err != nil {
+	// Open the socket first, then load providers (reads credentials from
+	// coffer); requests that arrive during the load wait for it. A failed
+	// load is still fatal. Run blocks until shutdown.
+	if err := d.RunWithStartupLoad(); err != nil {
 		fatal("daemon error: %v", err)
 	}
 }

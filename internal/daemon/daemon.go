@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,12 @@ import (
 // first, then `wicket reload` if they still want to force a re-read.
 var ErrReloadRequiresUnlock = errors.New("daemon is locked; run 'wicket unlock' before reload")
 
+// providerLoadWorkers bounds how many providers LoadProviders initializes at
+// once. Each one is a `coffer get` subprocess doing a sops decrypt; run one at
+// a time, ~93 of them took 54-93s on a cold boot (2026-10-17). A small pool
+// cuts that several-fold without stampeding sops/age with ~93 processes.
+const providerLoadWorkers = 4
+
 // Daemon is the main wicket daemon process. It manages the Unix socket
 // listener, provider registry, audit logging, and lifecycle (lock/unlock/stop).
 type Daemon struct {
@@ -57,6 +64,16 @@ type Daemon struct {
 
 	// Idle timeout
 	idleTimer *time.Timer
+
+	// Startup readiness. RunWithStartupLoad opens the socket BEFORE the
+	// (slow) startup provider load, so a client arriving during it finds the
+	// socket and waits for ready instead of getting "no such file" and giving
+	// up. ready is closed exactly once (markReady) when the load finishes;
+	// startupErr is written before the close, so reading it after <-ready is
+	// race-free.
+	ready      chan struct{}
+	readyOnce  sync.Once
+	startupErr error
 
 	// Shutdown coordination
 	ctx    context.Context
@@ -82,6 +99,7 @@ func New(cfg *config.Config) (*Daemon, error) {
 		notifier:  notify.NewNotifier(cfg.NtfyTopic),
 		cache:     newTokenCache(),
 		startTime: time.Now(),
+		ready:     make(chan struct{}),
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -103,10 +121,45 @@ func New(cfg *config.Config) (*Daemon, error) {
 // the just-superseded credential (e.g. the pre-rotation secret) out of the
 // old provider instance instead of leaving it as an orphaned, unreferenced,
 // un-zeroed object for the GC to eventually reclaim on its own schedule.
+//
+// Providers are initialized by a pool of providerLoadWorkers goroutines (each
+// is an independent, read-only `coffer get`), then applied in name order, so
+// the outcome is the same as loading them one at a time: a missing credential
+// skips that provider, any other error abandons the whole load.
 func (d *Daemon) LoadProviders() error {
-	fresh := make(map[string]provider.TokenProvider, len(d.cfg.Providers))
-	for name, pcfg := range d.cfg.Providers {
-		p, err := d.initProvider(name, pcfg)
+	names := make([]string, 0, len(d.cfg.Providers))
+	for name := range d.cfg.Providers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	type loadResult struct {
+		p   provider.TokenProvider
+		err error
+	}
+	results := make([]loadResult, len(names))
+	jobs := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < min(providerLoadWorkers, len(names)); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				p, err := d.initProvider(names[i], d.cfg.Providers[names[i]])
+				results[i] = loadResult{p: p, err: err}
+			}
+		}()
+	}
+	for i := range names {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	fresh := make(map[string]provider.TokenProvider, len(names))
+	for i, name := range names {
+		pcfg := d.cfg.Providers[name]
+		p, err := results[i].p, results[i].err
 		if errors.Is(err, coffer.ErrNotFound) {
 			// A provider whose credential is not in the vault yet (e.g. a new
 			// provider rendered before its operator-run setup) fails closed on
@@ -116,10 +169,13 @@ func (d *Daemon) LoadProviders() error {
 			continue
 		}
 		if err != nil {
-			// Zero whatever credentials were already loaded into the
-			// abandoned map before bailing out.
-			for _, loaded := range fresh {
-				loaded.Close()
+			// Zero whatever credentials were already loaded before bailing
+			// out: every successfully built provider, including those after
+			// this one in name order (the pool built them all).
+			for _, r := range results {
+				if r.err == nil && r.p != nil {
+					r.p.Close()
+				}
 			}
 			return fmt.Errorf("failed to initialize provider %q: %w", name, err)
 		}
@@ -231,10 +287,32 @@ func (d *Daemon) initProvider(name string, pcfg config.ProviderConfig) (provider
 	}
 }
 
-// Run starts the daemon: creates the socket, writes the PID file, and
-// begins accepting connections. It blocks until the context is cancelled
-// or a shutdown signal is received.
+// Run starts the daemon with whatever providers are already loaded (callers
+// that need them call LoadProviders first): creates the socket, writes the
+// PID file, and begins accepting connections. It blocks until the context is
+// cancelled or a shutdown signal is received.
 func (d *Daemon) Run() error {
+	return d.run(false)
+}
+
+// RunWithStartupLoad is Run with the startup provider load moved AFTER the
+// socket is listening. This is what `wicket start` uses.
+//
+// Why: loading every provider takes a minute or more on a cold boot, and the
+// socket used to appear only after it. A client that asked in that window
+// (e.g. a Claude Code MCP headers helper at login) found no socket, treated
+// wicket as down and gave up for the whole session. Now the socket exists
+// within milliseconds of start; any request that arrives during the load
+// waits for it (up to protocol.StartupWait) and is then served normally.
+//
+// A failed startup load is still fatal, as before: waiting clients get an
+// INTERNAL_ERROR, the daemon shuts down, and Run returns the error so the
+// process exits non-zero and launchd's KeepAlive retries it.
+func (d *Daemon) RunWithStartupLoad() error {
+	return d.run(true)
+}
+
+func (d *Daemon) run(loadAtStartup bool) error {
 	// Check for stale socket/PID (indicates previous unclean exit)
 	d.detectStaleState()
 
@@ -268,12 +346,15 @@ func (d *Daemon) Run() error {
 		return fmt.Errorf("failed to write PID file: %w", err)
 	}
 
-	// Set up idle timeout if configured
+	// Set up idle timeout if configured. It is created stopped and only
+	// armed once startup is ready, so it can never lock the daemon in the
+	// middle of the startup load.
 	if d.cfg.IdleTimeout.Duration > 0 {
 		d.idleTimer = time.AfterFunc(d.cfg.IdleTimeout.Duration, func() {
 			slog.Info("idle timeout reached, locking daemon")
 			d.Lock()
 		})
+		d.idleTimer.Stop()
 	}
 
 	// Set up signal handling for graceful shutdown
@@ -289,11 +370,50 @@ func (d *Daemon) Run() error {
 		}
 	}()
 
-	slog.Info("wicket daemon started",
-		"socket", d.cfg.SocketPath,
-		"pid", os.Getpid(),
-		"providers", len(d.providers),
-	)
+	if loadAtStartup {
+		slog.Info("wicket daemon listening, loading providers",
+			"socket", d.cfg.SocketPath,
+			"pid", os.Getpid(),
+			"providers_configured", len(d.cfg.Providers),
+		)
+		go func() {
+			started := time.Now()
+			if err := d.LoadProviders(); err != nil {
+				slog.Error("startup provider load failed", "error", err)
+				d.markReady(fmt.Errorf("failed to load providers: %w", err))
+				d.cancel()
+				return
+			}
+			if d.ctx.Err() != nil {
+				// Stopped while loading: shutdown may already have zeroed
+				// the (then empty) registry, so zero what was just loaded.
+				d.pmu.RLock()
+				for _, p := range d.providers {
+					p.Close()
+				}
+				d.pmu.RUnlock()
+				return
+			}
+			d.pmu.RLock()
+			loaded := len(d.providers)
+			d.pmu.RUnlock()
+			slog.Info("wicket daemon ready",
+				"providers", loaded,
+				"load_seconds", time.Since(started).Seconds(),
+			)
+			d.markReady(nil)
+		}()
+	} else {
+		d.pmu.RLock()
+		loaded := len(d.providers)
+		d.pmu.RUnlock()
+		slog.Info("wicket daemon started",
+			"socket", d.cfg.SocketPath,
+			"pid", os.Getpid(),
+			"providers", loaded,
+		)
+		d.markReady(nil)
+	}
 
 	// Accept loop
 	go func() {
@@ -319,7 +439,87 @@ func (d *Daemon) Run() error {
 
 	// Wait for shutdown signal
 	<-d.ctx.Done()
-	return d.shutdown()
+	if err := d.shutdown(); err != nil {
+		return err
+	}
+	select {
+	case <-d.ready:
+		return d.startupErr
+	default:
+		return nil // stopped (signal) before the startup load finished
+	}
+}
+
+// markReady records the outcome of startup and releases every request
+// waiting in awaitReady. Only the first call has any effect.
+func (d *Daemon) markReady(err error) {
+	d.readyOnce.Do(func() {
+		d.startupErr = err
+		if err == nil {
+			d.resetIdleTimer()
+		}
+		close(d.ready)
+	})
+}
+
+// awaitReady blocks a request that arrived while the startup provider load
+// is still running, until it finishes (or protocol.StartupWait passes, or the
+// daemon shuts down). It reports whether the request may proceed; if not, it
+// has already written the error response.
+//
+// While waiting it first writes protocol.LoadingMarker (a lone newline, which
+// a JSON decoder skips as whitespace) so a current client knows to stretch
+// its short default timeout to cover the wait. Clients that predate the
+// marker simply ignore it.
+func (d *Daemon) awaitReady(conn net.Conn) bool {
+	select {
+	case <-d.ready:
+		return d.startupOK(conn)
+	default:
+	}
+
+	conn.SetDeadline(time.Now().Add(protocol.StartupWait + 30*time.Second))
+	if _, err := conn.Write([]byte(protocol.LoadingMarker)); err != nil {
+		return false // client already gone
+	}
+
+	timer := time.NewTimer(protocol.StartupWait)
+	defer timer.Stop()
+	select {
+	case <-d.ready:
+	case <-timer.C:
+		writeJSON(conn, protocol.ErrorResponse{
+			Error: fmt.Sprintf("daemon is still loading providers after %s", protocol.StartupWait),
+			Code:  protocol.ErrInternalError,
+		})
+		return false
+	case <-d.ctx.Done():
+		writeJSON(conn, protocol.ErrorResponse{
+			Error: "daemon is shutting down",
+			Code:  protocol.ErrInternalError,
+		})
+		return false
+	}
+
+	if !d.startupOK(conn) {
+		return false
+	}
+	// Give the request the normal budget from now, not from when it arrived.
+	conn.SetDeadline(time.Now().Add(30 * time.Second))
+	return true
+}
+
+// startupOK reports whether startup succeeded, answering the request with
+// an error if it did not. Only valid once ready is closed.
+func (d *Daemon) startupOK(conn net.Conn) bool {
+	if d.startupErr == nil {
+		return true
+	}
+	writeJSON(conn, protocol.ErrorResponse{
+		Error: fmt.Sprintf("daemon failed to start: %v", d.startupErr),
+		Code:  protocol.ErrInternalError,
+	})
+	return false
 }
 
 // handleConnection processes a single client connection: authenticate,
@@ -354,6 +554,11 @@ func (d *Daemon) handleConnection(conn net.Conn) {
 			Error: fmt.Sprintf("invalid request: %v", err),
 			Code:  protocol.ErrInvalidRequest,
 		})
+		return
+	}
+
+	// A request that arrives during the startup provider load waits for it.
+	if !d.awaitReady(conn) {
 		return
 	}
 

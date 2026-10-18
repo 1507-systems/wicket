@@ -93,12 +93,28 @@ Installed to `~/.local/bin/wicket` or `/usr/local/bin/wicket`.
 ### Startup
 
 1. Parse config from `~/.config/wicket/config.yaml`
-2. Read coffer vault at configured path
-3. Decrypt root credentials into memory (requires age identity / passphrase)
-4. Initialize provider instances with their root credentials
-5. Create Unix socket at configured path with 0700 permissions
-6. Begin accepting connections
-7. Write PID file to `~/.config/wicket/wicket.pid`
+2. Create Unix socket at configured path with 0700 permissions
+3. Write PID file to `~/.config/wicket/wicket.pid`
+4. Begin accepting connections
+5. Read coffer vault at configured path and decrypt root credentials into memory
+   (one `coffer get` per credential, run by a pool of 4 workers)
+6. Initialize provider instances with their root credentials
+7. Mark the daemon ready (and arm the idle timer)
+
+The socket is opened **before** the provider load (2026-10-17). The load is one
+sops decrypt per credential and took 54-93s on a cold boot when it ran serially;
+while the socket appeared only after it, any client that asked in that window
+(notably the Claude Code MCP headers helpers at login) saw no socket, treated
+wicket as down, and stayed broken for its whole session.
+
+A request that arrives during the load is held until the load finishes, for up
+to 120s (`protocol.StartupWait`), then served normally. While holding it the
+daemon first writes a single newline (`protocol.LoadingMarker`) ahead of the JSON
+response; JSON decoders skip it as whitespace, and the wicket client takes it as
+the cue to extend its 5s default timeout by `StartupWait`. If the wait expires
+the request gets `INTERNAL_ERROR`. A failed startup load is still fatal: held
+requests get `INTERNAL_ERROR`, the daemon shuts down, and the process exits
+non-zero so launchd's `KeepAlive` retries it.
 
 ### Idle Lock
 
