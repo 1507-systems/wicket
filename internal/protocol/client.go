@@ -3,6 +3,7 @@
 package protocol
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -21,6 +22,19 @@ type Client struct {
 // the 5s default, and 42s right after a coffer set (2026-10-15). The daemon
 // extends its own deadline for these requests to the same value.
 const LoadTimeout = 120 * time.Second
+
+// StartupWait is how long the daemon holds a request that arrives while its
+// startup provider load is still running before answering it with an error.
+// The daemon listens on its socket before that load (which took 54-93s on a
+// cold boot, 2026-10-17), so early callers wait instead of finding no socket.
+const StartupWait = 120 * time.Second
+
+// LoadingMarker is what the daemon writes first, before the real response,
+// when it is holding a request for the startup load. It is a lone newline, so
+// any JSON decoder (including clients that predate it) skips it as
+// whitespace; a current client takes it as the cue to extend its deadline by
+// StartupWait. A daemon never otherwise writes leading whitespace.
+const LoadingMarker = "\n"
 
 // NewClient creates a client that connects to the given socket path.
 func NewClient(socketPath string) *Client {
@@ -49,8 +63,16 @@ func (c *Client) Send(req *Request) (json.RawMessage, error) {
 		return nil, fmt.Errorf("failed to send request: %w", err)
 	}
 
-	// Read the response
-	decoder := json.NewDecoder(conn)
+	// Read the response. A leading LoadingMarker means the daemon is still
+	// loading providers and will answer once it is done: stretch the deadline
+	// to cover that instead of timing out on the short default.
+	br := bufio.NewReader(conn)
+	if b, err := br.Peek(1); err == nil && b[0] == LoadingMarker[0] {
+		if err := conn.SetDeadline(time.Now().Add(StartupWait + c.Timeout)); err != nil {
+			return nil, fmt.Errorf("failed to set connection deadline: %w", err)
+		}
+	}
+	decoder := json.NewDecoder(br)
 	var raw json.RawMessage
 	if err := decoder.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("failed to read response: %w", err)
