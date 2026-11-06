@@ -4,7 +4,12 @@ on:
     branches: [main]
 jobs:
   close:
-    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@731f01df181e1968d2123410744f2ab7a9d06fed
+    # coffer#40's shared workflow lists the merged PR, so the job needs
+    # pull-requests: read as well as contents: read.
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@c12aa669b5441f1168b3963207e56e82f9995910
     with:
       # Self-hosted when the repo sets RUNNER_LABEL (private repos);
       # GitHub-hosted otherwise (free for public repos).
