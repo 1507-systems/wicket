@@ -4,5 +4,11 @@ on:
     branches: [main]
 jobs:
   close:
-    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@da3d7227985b583e9f61788b415ca0dec98353ef
-    secrets: inherit
+    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@731f01df181e1968d2123410744f2ab7a9d06fed
+    with:
+      # Self-hosted when the repo sets RUNNER_LABEL (private repos);
+      # GitHub-hosted otherwise (free for public repos).
+      runs_on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+      cortex_api_base: ${{ vars.CORTEX_API_BASE || 'https://cortex.1507.cloud' }}
+    secrets:
+      CORTEX_WRITE_TOKEN: ${{ secrets.CORTEX_WRITE_TOKEN }}
