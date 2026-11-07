@@ -69,10 +69,20 @@ func (n *Notifier) Enabled() bool { return n.endpoint != "" }
 // Send sends an urgent notification via ntfy. The eventType is used for
 // rate limiting (only one notification per event type per 5 minutes).
 // This is fire-and-forget: a notification failure never blocks daemon
-// operation.
+// operation. While the pause file is in force (see PauseFileEnv) only the
+// outbound POST is muted; callers, state and logs carry on as normal.
 func (n *Notifier) Send(eventType, title, message string) {
 	if !n.Enabled() {
 		slog.Debug("ntfy notification dropped: no topic configured", "event_type", eventType)
+		return
+	}
+
+	// The pause check comes before the rate limiter on purpose: a suppressed
+	// send must not record lastSent, so the alert fires on the first event
+	// after the pause ends instead of waiting out a rate-limit window.
+	if path := pauseFilePath(); pauseInForce(path, time.Now()) {
+		slog.Info("ntfy notification suppressed: alerts paused",
+			"event_type", eventType, "pause_file", path)
 		return
 	}
 

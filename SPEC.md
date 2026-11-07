@@ -223,6 +223,8 @@ Critical failures MUST send urgent push notifications via ntfy so the operator i
 
 `WICKET_NTFY_TOKEN`, when set, is attached as `Authorization: Bearer` for servers that require an authenticated publish. Unset means an anonymous publish.
 
+**Pause (no deploy):** while the pause file `~/.local/state/wicket/notify-paused` (override: `WICKET_PAUSE_FILE`) is in force, the ntfy POST is skipped and one log line is written instead; nothing else changes. The file is read on every send. It is in force when empty, `indefinite`, or a future ISO-8601 time (no zone = UTC, full `YYYY-MM-DD` prefix required); anything else fails open. A suppressed send does not consume the rate-limit slot. Operator steps: README.md "Pausing alerts (no deploy)".
+
 ```bash
 # Shape of the request wicket issues (URL supplied at runtime, never committed):
 curl -s -H "Priority: urgent" -H "Title: Wicket Error" -H "Tags: key,warning" \

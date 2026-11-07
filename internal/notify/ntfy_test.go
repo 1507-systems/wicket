@@ -3,6 +3,7 @@ package notify
 import (
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -34,6 +35,8 @@ func TestEnvOverridesConfiguredTopic(t *testing.T) {
 func TestSendPostsToConfiguredTopic(t *testing.T) {
 	t.Setenv(EndpointEnv, "")
 	t.Setenv("WICKET_NTFY_TOKEN", "test-token")
+	// Hermetic: a real pause file on the test host must not mute this send.
+	t.Setenv(PauseFileEnv, filepath.Join(t.TempDir(), "absent"))
 
 	got := make(chan *http.Request, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
