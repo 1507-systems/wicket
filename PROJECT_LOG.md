@@ -1,6 +1,14 @@
 <!-- summary: Local credential broker daemon — exchanges root secrets from Coffer for short-lived scoped tokens via Unix socket. -->
 # Wicket -- Project Log
 
+## 2026-11-07
+
+### No-deploy alert pause
+
+- `Notifier.Send` now checks `~/.local/state/wicket/notify-paused` (override `WICKET_PAUSE_FILE`) on every send and skips the ntfy POST while it is in force: empty, `indefinite`, or a future ISO-8601 time (no zone = UTC). Past, unparseable, bare numbers like `12345`, missing or unreadable files fail open. Same shape as provisioning's `scripts/lib/notify-pause.sh`; standing rule: alert senders must be pausable without a redeploy.
+- The pause check runs before the rate limiter, so a suppressed send never records `lastSent` and the first event after resume alerts at once.
+- Docs: README.md "Pausing alerts (no deploy)" (README.md is new). The running daemon picks this up only after the next normal `make install`; until then the installed binary has no pause.
+
 ## 2026-10-08
 
 ### `make install` detects the host class
