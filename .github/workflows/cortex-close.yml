@@ -9,7 +9,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@c12aa669b5441f1168b3963207e56e82f9995910
+    uses: 1507-systems/coffer/.github/workflows/cortex-close-shared.yml@d04c68bce22fe2e22e6da637fbad96f0907de3bc
     with:
       # Self-hosted when the repo sets RUNNER_LABEL (private repos);
       # GitHub-hosted otherwise (free for public repos).
