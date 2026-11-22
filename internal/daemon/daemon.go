@@ -47,9 +47,12 @@ const providerLoadWorkers = 4
 // Daemon is the main wicket daemon process. It manages the Unix socket
 // listener, provider registry, audit logging, and lifecycle (lock/unlock/stop).
 type Daemon struct {
-	cfg       *config.Config
-	listener  net.Listener
-	pmu       sync.RWMutex // guards providers (unlock swaps the map at runtime)
+	cfg      *config.Config
+	listener net.Listener
+	pmu      sync.RWMutex // guards providers (unlock swaps the map at runtime)
+	// loadMu serializes provider loads (startup, unlock, reload) and guards
+	// cfg.Providers, which reload replaces when config.yaml has changed.
+	loadMu    sync.Mutex
 	providers map[string]provider.TokenProvider
 	coffer    *coffer.Reader
 	auditor   *audit.Logger
@@ -127,8 +130,16 @@ func New(cfg *config.Config) (*Daemon, error) {
 // the outcome is the same as loading them one at a time: a missing credential
 // skips that provider, any other error abandons the whole load.
 func (d *Daemon) LoadProviders() error {
-	names := make([]string, 0, len(d.cfg.Providers))
-	for name := range d.cfg.Providers {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	return d.loadProviderSet(d.cfg.Providers)
+}
+
+// loadProviderSet builds and swaps in providers for the given config map.
+// Callers hold loadMu.
+func (d *Daemon) loadProviderSet(provs map[string]config.ProviderConfig) error {
+	names := make([]string, 0, len(provs))
+	for name := range provs {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -145,7 +156,7 @@ func (d *Daemon) LoadProviders() error {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				p, err := d.initProvider(names[i], d.cfg.Providers[names[i]])
+				p, err := d.initProvider(names[i], provs[names[i]])
 				results[i] = loadResult{p: p, err: err}
 			}
 		}()
@@ -158,7 +169,7 @@ func (d *Daemon) LoadProviders() error {
 
 	fresh := make(map[string]provider.TokenProvider, len(names))
 	for i, name := range names {
-		pcfg := d.cfg.Providers[name]
+		pcfg := provs[name]
 		p, err := results[i].p, results[i].err
 		if errors.Is(err, coffer.ErrNotFound) {
 			// A provider whose credential is not in the vault yet (e.g. a new
@@ -935,18 +946,57 @@ func (d *Daemon) handleUnlock(conn net.Conn) {
 // revoke tokens already derived from it), so unlike Lock -- which exists to
 // remove root credentials from memory entirely, cache included -- reload
 // leaves cache eviction to the normal per-request TTL check.
+//
+// Reload also re-reads config.yaml (when the daemon knows its path), so a
+// provider added to the config is picked up without a restart -- before
+// this, only the provider set parsed at startup was ever re-read, and a new
+// provider silently stayed invisible until `launchctl kickstart`. Only the
+// provider map is applied live; socket path, allowed binaries, audit log and
+// the rest still need a restart. If the new config fails to parse or
+// validate, the reload fails and the current providers stay in place.
 func (d *Daemon) Reload() error {
+	_, _, err := d.reloadDetailed()
+	return err
+}
+
+// reloadDetailed is Reload, also reporting which provider names the
+// re-read config added and removed.
+func (d *Daemon) reloadDetailed() (added, removed []string, err error) {
 	if d.locked.Load() {
-		return ErrReloadRequiresUnlock
+		return nil, nil, ErrReloadRequiresUnlock
 	}
 
-	slog.Info("reloading credentials from coffer")
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
 
-	if err := d.LoadProviders(); err != nil {
-		return fmt.Errorf("reload failed: %w", err)
+	provs := d.cfg.Providers
+	if d.cfg.Path != "" {
+		fresh, err := config.Load(d.cfg.Path)
+		if err != nil {
+			return nil, nil, fmt.Errorf("reload failed: re-reading config: %w", err)
+		}
+		provs = fresh.Providers
 	}
+	for name := range provs {
+		if _, ok := d.cfg.Providers[name]; !ok {
+			added = append(added, name)
+		}
+	}
+	for name := range d.cfg.Providers {
+		if _, ok := provs[name]; !ok {
+			removed = append(removed, name)
+		}
+	}
+	sort.Strings(added)
+	sort.Strings(removed)
 
-	return nil
+	slog.Info("reloading config and credentials from coffer", "providers_added", added, "providers_removed", removed)
+
+	if err := d.loadProviderSet(provs); err != nil {
+		return nil, nil, fmt.Errorf("reload failed: %w", err)
+	}
+	d.cfg.Providers = provs
+	return added, removed, nil
 }
 
 // handleReload re-reads coffer and rebuilds the provider registry without
@@ -954,7 +1004,8 @@ func (d *Daemon) Reload() error {
 func (d *Daemon) handleReload(conn net.Conn) {
 	// Loading every provider can outlast the 30s request deadline.
 	conn.SetDeadline(time.Now().Add(protocol.LoadTimeout))
-	if err := d.Reload(); err != nil {
+	added, removed, err := d.reloadDetailed()
+	if err != nil {
 		if errors.Is(err, ErrReloadRequiresUnlock) {
 			writeJSON(conn, protocol.ErrorResponse{
 				Error: err.Error(),
@@ -978,8 +1029,10 @@ func (d *Daemon) handleReload(conn net.Conn) {
 	d.pmu.RUnlock()
 
 	writeJSON(conn, protocol.ReloadResponse{
-		Status:          "reloaded",
-		ProvidersLoaded: providersLoaded,
+		Status:           "reloaded",
+		ProvidersLoaded:  providersLoaded,
+		ProvidersAdded:   added,
+		ProvidersRemoved: removed,
 	})
 }
 

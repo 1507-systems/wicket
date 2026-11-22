@@ -331,11 +331,19 @@ provider for — added 2026-08-16 after `unlock`'s no-op-when-already-unlocked
 behavior (above) meant a rotated Tailscale OAuth secret kept serving stale
 until a full `wicket stop && wicket start -d`.
 
+Reload also re-reads `config.yaml` (added 2026-11-21): a provider added to
+the config is picked up, and one removed from it stops being served, with no
+restart. Only the provider map is applied live; socket path, allowed
+binaries, audit log, PID file and the other top-level settings still need a
+restart. If the re-read config fails to parse or validate, the reload fails
+and the current providers keep serving.
+
 Requires the daemon to be unlocked: if it's locked, reload returns
 `{"error": "...", "code": "LOCKED"}` rather than implicitly unlocking —
 `Lock` is a deliberate security boundary and "refresh my credentials" must
 not silently walk past it. Run `unlock` first. On success, responds with
-`{"status": "reloaded", "providers_loaded": N}`.
+`{"status": "reloaded", "providers_loaded": N, "providers_added": [...], "providers_removed": [...]}`
+(the two lists are omitted when empty).
 
 Reload does not clear the token cache: a cached, still-live short-lived
 token remains valid regardless of whether the root credential that minted
@@ -357,7 +365,7 @@ wicket status                         # Show daemon status, loaded providers
 wicket lock                           # Immediately lock the daemon
 wicket unlock                         # Unlock daemon (reads coffer passphrase)
 wicket unlock --auto                  # Unlock using keychain-stored coffer password
-wicket reload                         # Re-read coffer for all providers in place (no-op-when-unlocked fix; requires unlocked)
+wicket reload                         # Re-read config.yaml + coffer in place: picks up added/removed providers and rotated values (requires unlocked)
 
 wicket get <provider>/<scope>         # Request a token (prints to stdout)
 wicket get cloudflare/dns             # Short-lived Cloudflare DNS token

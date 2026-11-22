@@ -87,7 +87,7 @@ Usage:
   wicket get <provider>/<scope>     Request a scoped token (token printed to stdout)
   wicket lock                       Immediately lock the daemon
   wicket unlock                     Unlock the daemon (re-reads coffer if it was locked)
-  wicket reload                     Re-read coffer for all providers in place (requires unlocked)
+  wicket reload                     Re-read config.yaml + coffer in place (requires unlocked)
   wicket audit [--limit N]          Show recent audit log entries
   wicket providers                  List configured providers
   wicket version                    Print version info
@@ -316,6 +316,12 @@ func cmdReload() {
 	}
 
 	fmt.Fprintf(os.Stderr, "wicket: daemon reloaded (%d providers loaded)\n", resp.ProvidersLoaded)
+	if len(resp.ProvidersAdded) > 0 {
+		fmt.Fprintf(os.Stderr, "wicket: added: %s\n", strings.Join(resp.ProvidersAdded, ", "))
+	}
+	if len(resp.ProvidersRemoved) > 0 {
+		fmt.Fprintf(os.Stderr, "wicket: removed: %s\n", strings.Join(resp.ProvidersRemoved, ", "))
+	}
 }
 
 // cmdAudit shows recent audit log entries.

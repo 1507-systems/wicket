@@ -514,3 +514,113 @@ func TestReloadDoesNotClearTokenCache(t *testing.T) {
 		t.Errorf("provider called %d times, want 1 (cached token must not be re-minted by reload)", got)
 	}
 }
+
+// Reload must re-read config.yaml, not just coffer: a provider added to the
+// config after startup used to stay invisible until a full restart, a trap
+// operators and agents kept falling into (2026-11-21).
+
+// writeReloadConfig writes a config.yaml naming the given passthrough
+// providers (name -> coffer path) and returns its path.
+func writeReloadConfig(t *testing.T, dir, vaultDir string, provs map[string]string) string {
+	t.Helper()
+	stateDir := t.TempDir()
+	var b strings.Builder
+	fmt.Fprintf(&b, "coffer_path: %s\nsocket_path: %s\naudit_log: %s\npid_file: %s\nproviders:\n",
+		vaultDir, filepath.Join(stateDir, "w.sock"), filepath.Join(stateDir, "audit.log"), filepath.Join(stateDir, "w.pid"))
+	for name, path := range provs {
+		fmt.Fprintf(&b, "  %s:\n    type: passthrough\n    credential: %s\n", name, path)
+	}
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte(b.String()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func newConfigFileDaemon(t *testing.T, cfgPath string) *Daemon {
+	t.Helper()
+	cfg, err := config.Load(cfgPath)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	d, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	t.Cleanup(func() { d.auditor.Close() })
+	if err := d.LoadProviders(); err != nil {
+		t.Fatalf("LoadProviders: %v", err)
+	}
+	return d
+}
+
+func TestReloadPicksUpProviderAddedToConfig(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	setFakeCofferValue(t, vaultDir, "b/two", "v2")
+	cfgPath := writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"})
+	d := newConfigFileDaemon(t, cfgPath)
+
+	if got := callHandleGet(t, d, "beta", "token"); got["token"] != nil {
+		t.Fatalf("beta served before it was configured: %v", got)
+	}
+
+	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one", "beta": "b/two"})
+	added, removed, err := d.reloadDetailed()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if fmt.Sprint(added) != "[beta]" || len(removed) != 0 {
+		t.Errorf("added=%v removed=%v, want [beta] []", added, removed)
+	}
+	if got := callHandleGet(t, d, "beta", "token"); got["token"] != "v2" {
+		t.Errorf("beta after reload = %v, want v2", got)
+	}
+	if got := callHandleGet(t, d, "alpha", "token"); got["token"] != "v1" {
+		t.Errorf("alpha after reload = %v, want v1", got)
+	}
+}
+
+func TestReloadDropsProviderRemovedFromConfig(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	setFakeCofferValue(t, vaultDir, "b/two", "v2")
+	cfgPath := writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one", "beta": "b/two"})
+	d := newConfigFileDaemon(t, cfgPath)
+	if got := callHandleGet(t, d, "beta", "token"); got["token"] != "v2" {
+		t.Fatalf("beta before = %v", got)
+	}
+
+	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"})
+	_, removed, err := d.reloadDetailed()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if fmt.Sprint(removed) != "[beta]" {
+		t.Errorf("removed=%v, want [beta]", removed)
+	}
+	// Served from neither the registry nor the token cache.
+	if got := callHandleGet(t, d, "beta", "token"); got["token"] != nil {
+		t.Errorf("removed provider still served: %v", got)
+	}
+}
+
+func TestReloadKeepsProvidersWhenConfigIsBroken(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	cfgPath := writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"})
+	d := newConfigFileDaemon(t, cfgPath)
+
+	if err := os.WriteFile(cfgPath, []byte("providers: [this is: not valid"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Reload(); err == nil {
+		t.Fatal("Reload() with a broken config returned nil error")
+	}
+	if got := callHandleGet(t, d, "alpha", "token"); got["token"] != "v1" {
+		t.Errorf("alpha after failed reload = %v, want v1 (still served)", got)
+	}
+}
