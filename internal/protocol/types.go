@@ -95,6 +95,9 @@ type UnlockResponse struct {
 
 // ReloadResponse is returned by the "reload" action.
 type ReloadResponse struct {
-	Status          string `json:"status"` // "reloaded"
-	ProvidersLoaded int    `json:"providers_loaded"`
+	Status           string   `json:"status"` // "reloaded"
+	ProvidersLoaded  int      `json:"providers_loaded"`
+	ProvidersAdded   []string `json:"providers_added,omitempty"`   // new in config.yaml since the last load
+	ProvidersRemoved []string `json:"providers_removed,omitempty"` // gone from config.yaml
+	ProvidersSkipped []string `json:"providers_skipped,omitempty"` // configured, credential not in coffer yet
 }

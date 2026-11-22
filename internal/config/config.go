@@ -60,6 +60,10 @@ type Config struct {
 	// WICKET_NTFY_TOPIC overrides it; when both are empty, alerts are off.
 	NtfyTopic string                    `yaml:"ntfy_topic"`
 	Providers map[string]ProviderConfig `yaml:"providers"`
+
+	// Path is the file this config was loaded from (set by Load, never read
+	// from YAML). Reload re-reads it so newly added providers are picked up.
+	Path string `yaml:"-"`
 }
 
 // ProviderConfig holds the type-specific configuration for a single provider.
@@ -191,6 +195,7 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 
+	cfg.Path = path
 	return cfg, nil
 }
 

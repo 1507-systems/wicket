@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"sync"
@@ -47,9 +48,12 @@ const providerLoadWorkers = 4
 // Daemon is the main wicket daemon process. It manages the Unix socket
 // listener, provider registry, audit logging, and lifecycle (lock/unlock/stop).
 type Daemon struct {
-	cfg       *config.Config
-	listener  net.Listener
-	pmu       sync.RWMutex // guards providers (unlock swaps the map at runtime)
+	cfg      *config.Config
+	listener net.Listener
+	pmu      sync.RWMutex // guards providers (unlock swaps the map at runtime)
+	// loadMu serializes provider loads (startup, unlock, reload) and guards
+	// cfg.Providers, which reload replaces when config.yaml has changed.
+	loadMu    sync.Mutex
 	providers map[string]provider.TokenProvider
 	coffer    *coffer.Reader
 	auditor   *audit.Logger
@@ -61,6 +65,11 @@ type Daemon struct {
 	lastRequest  atomic.Value // *time.Time
 	tokensIssued atomic.Int64
 	locked       atomic.Bool
+	// lockGen is bumped by every Lock call (even a redundant one). A load
+	// (unlock or reload) records it first and, if it changed by the time the
+	// new providers are in place, discards them: a lock that raced the load
+	// wins, without Lock having to wait for a slow load to finish.
+	lockGen atomic.Int64
 
 	// Idle timeout
 	idleTimer *time.Timer
@@ -127,8 +136,18 @@ func New(cfg *config.Config) (*Daemon, error) {
 // the outcome is the same as loading them one at a time: a missing credential
 // skips that provider, any other error abandons the whole load.
 func (d *Daemon) LoadProviders() error {
-	names := make([]string, 0, len(d.cfg.Providers))
-	for name := range d.cfg.Providers {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	_, err := d.loadProviderSet(d.cfg.Providers)
+	return err
+}
+
+// loadProviderSet builds and swaps in providers for the given config map,
+// returning the names skipped because their credential is not in coffer.
+// Callers hold loadMu.
+func (d *Daemon) loadProviderSet(provs map[string]config.ProviderConfig) (skipped []string, err error) {
+	names := make([]string, 0, len(provs))
+	for name := range provs {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -145,7 +164,7 @@ func (d *Daemon) LoadProviders() error {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				p, err := d.initProvider(names[i], d.cfg.Providers[names[i]])
+				p, err := d.initProvider(names[i], provs[names[i]])
 				results[i] = loadResult{p: p, err: err}
 			}
 		}()
@@ -158,7 +177,7 @@ func (d *Daemon) LoadProviders() error {
 
 	fresh := make(map[string]provider.TokenProvider, len(names))
 	for i, name := range names {
-		pcfg := d.cfg.Providers[name]
+		pcfg := provs[name]
 		p, err := results[i].p, results[i].err
 		if errors.Is(err, coffer.ErrNotFound) {
 			// A provider whose credential is not in the vault yet (e.g. a new
@@ -166,6 +185,7 @@ func (d *Daemon) LoadProviders() error {
 			// its own: it is left out, so a get for it returns unknown
 			// provider. It must not take every other provider down with it.
 			slog.Error("skipping provider: credential not in coffer", "name", name, "type", pcfg.Type, "error", err)
+			skipped = append(skipped, name)
 			continue
 		}
 		if err != nil {
@@ -177,7 +197,7 @@ func (d *Daemon) LoadProviders() error {
 					r.p.Close()
 				}
 			}
-			return fmt.Errorf("failed to initialize provider %q: %w", name, err)
+			return nil, fmt.Errorf("failed to initialize provider %q: %w", name, err)
 		}
 		fresh[name] = p
 		slog.Info("loaded provider", "name", name, "type", pcfg.Type, "scopes", p.Scopes())
@@ -193,7 +213,7 @@ func (d *Daemon) LoadProviders() error {
 			slog.Error("failed to close superseded provider", "provider", p.Name(), "error", err)
 		}
 	}
-	return nil
+	return skipped, nil
 }
 
 // initProvider creates a single provider instance by reading its credentials
@@ -734,7 +754,15 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 	// Cache for reuse while >30% of the TTL remains (no-op for passthrough
 	// tokens, which have no expiry; options-shaped tokens are never cached)
 	if cacheable {
-		d.cache.put(req.Provider, req.Scope, token, now)
+		// Only if this provider instance is still the one being served: a
+		// reload may have replaced it (and evicted its cache) while this
+		// token was being minted. pmu is held across check and put so the
+		// swap cannot land between them.
+		d.pmu.RLock()
+		if cur, ok := d.providers[req.Provider]; ok && cur == p {
+			d.cache.put(req.Provider, req.Scope, token, now)
+		}
+		d.pmu.RUnlock()
 	}
 
 	// Log the successful issuance
@@ -853,12 +881,20 @@ func (d *Daemon) handleLock(conn net.Conn) {
 // to locked state. The socket remains open but returns LOCKED errors.
 // Cached tokens are dropped along with the credentials that minted them.
 func (d *Daemon) Lock() {
-	if d.locked.Load() {
+	// Flag first, so a load that is swapping providers in right now sees it
+	// (see lockGen); then clear what is loaded.
+	d.lockGen.Add(1)
+	if d.locked.Swap(true) {
 		return // Already locked
 	}
 
 	slog.Info("locking daemon, clearing credentials from memory")
+	d.clearLoaded()
+}
 
+// clearLoaded zeroes the token cache and every loaded provider's root
+// credential. Used by Lock, and by a load that lost a race with Lock.
+func (d *Daemon) clearLoaded() {
 	d.cache.clear()
 
 	d.pmu.RLock()
@@ -868,8 +904,6 @@ func (d *Daemon) Lock() {
 		}
 	}
 	d.pmu.RUnlock()
-
-	d.locked.Store(true)
 }
 
 // Unlock re-reads root credentials from coffer, rebuilds the provider
@@ -882,10 +916,17 @@ func (d *Daemon) Unlock() error {
 
 	slog.Info("unlocking daemon, re-reading credentials from coffer")
 
-	if err := d.LoadProviders(); err != nil {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	gen := d.lockGen.Load()
+	if _, err := d.loadProviderSet(d.cfg.Providers); err != nil {
 		return fmt.Errorf("unlock failed: %w", err)
 	}
-
+	if d.lockGen.Load() != gen {
+		// A lock arrived while we were loading: it wins.
+		d.clearLoaded()
+		return fmt.Errorf("unlock abandoned: the daemon was locked again while loading")
+	}
 	d.locked.Store(false)
 	d.resetIdleTimer()
 	return nil
@@ -929,24 +970,129 @@ func (d *Daemon) handleUnlock(conn net.Conn) {
 // for that case.
 //
 // Reload requires the daemon to already be unlocked -- see
-// ErrReloadRequiresUnlock. It does not touch the token cache: a cached,
-// still-live short-lived token remains valid regardless of whether the root
-// credential that minted it was just rotated (rotating a meta-token doesn't
-// revoke tokens already derived from it), so unlike Lock -- which exists to
-// remove root credentials from memory entirely, cache included -- reload
-// leaves cache eviction to the normal per-request TTL check.
+// ErrReloadRequiresUnlock. It evicts cached tokens only for providers whose
+// config changed or was removed. A cached token whose provider config is
+// unchanged stays valid even if the root credential was just rotated
+// (rotating a meta-token doesn't revoke tokens already derived from it), so
+// for those, eviction is left to the normal per-request TTL check.
+//
+// Reload also re-reads config.yaml (when the daemon knows its path), so a
+// provider added to the config is picked up without a restart -- before
+// this, only the provider set parsed at startup was ever re-read, and a new
+// provider silently stayed invisible until `launchctl kickstart`. Only the
+// provider map is applied live; socket path, allowed binaries, audit log and
+// the rest still need a restart. If the new config fails to parse or
+// validate, the reload fails and the current providers stay in place.
 func (d *Daemon) Reload() error {
+	_, err := d.reloadDetailed()
+	return err
+}
+
+// reloadResult reports what a reload changed, by what actually loaded.
+type reloadResult struct {
+	Added   []string // serving now, not before
+	Removed []string // served before, not now
+	Skipped []string // configured, but the credential is not in coffer yet
+}
+
+// errReloadConfig marks a reload that failed reading config.yaml (as opposed
+// to reading coffer), so the alert can say which.
+var errReloadConfig = errors.New("re-reading config")
+
+// reloadDetailed is Reload, also reporting what changed.
+func (d *Daemon) reloadDetailed() (reloadResult, error) {
+	var res reloadResult
 	if d.locked.Load() {
-		return ErrReloadRequiresUnlock
+		return res, ErrReloadRequiresUnlock
 	}
 
-	slog.Info("reloading credentials from coffer")
-
-	if err := d.LoadProviders(); err != nil {
-		return fmt.Errorf("reload failed: %w", err)
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	// Lock may have run while we waited for loadMu.
+	if d.locked.Load() {
+		return res, ErrReloadRequiresUnlock
 	}
 
-	return nil
+	provs := d.cfg.Providers
+	if d.cfg.Path != "" {
+		fresh, err := config.Load(d.cfg.Path)
+		if err != nil {
+			return res, fmt.Errorf("%w: %v", errReloadConfig, err)
+		}
+		provs = fresh.Providers
+		if ignored := nonProviderChanges(d.cfg, fresh); len(ignored) > 0 {
+			slog.Warn("reload applies providers only; restart wicket for these changed settings", "settings", ignored)
+		}
+	}
+
+	before := d.providerNames()
+	gen := d.lockGen.Load()
+	slog.Info("reloading config and credentials from coffer")
+	skipped, err := d.loadProviderSet(provs)
+	if err != nil {
+		return res, err
+	}
+	if d.lockGen.Load() != gen || d.locked.Load() {
+		// Locked while loading: do not leave fresh credentials in memory.
+		d.clearLoaded()
+		return reloadResult{}, ErrReloadRequiresUnlock
+	}
+	after := d.providerNames()
+
+	// Tokens minted under a config that changed or went away must not be
+	// served from the cache.
+	for name, old := range d.cfg.Providers {
+		if nc, ok := provs[name]; !ok || !reflect.DeepEqual(old, nc) {
+			d.cache.evictProvider(name)
+		}
+	}
+	d.cfg.Providers = provs
+
+	for name := range after {
+		if !before[name] {
+			res.Added = append(res.Added, name)
+		}
+	}
+	for name := range before {
+		if !after[name] {
+			res.Removed = append(res.Removed, name)
+		}
+	}
+	sort.Strings(res.Added)
+	sort.Strings(res.Removed)
+	res.Skipped = skipped
+	slog.Info("reload complete", "providers_added", res.Added, "providers_removed", res.Removed, "providers_skipped", res.Skipped)
+	return res, nil
+}
+
+// providerNames returns the names currently being served.
+func (d *Daemon) providerNames() map[string]bool {
+	d.pmu.RLock()
+	defer d.pmu.RUnlock()
+	names := make(map[string]bool, len(d.providers))
+	for name := range d.providers {
+		names[name] = true
+	}
+	return names
+}
+
+// nonProviderChanges lists the top-level settings that differ between the
+// running config and a re-read one. Reload does not apply them.
+func nonProviderChanges(cur, fresh *config.Config) []string {
+	var out []string
+	check := func(name string, a, b any) {
+		if !reflect.DeepEqual(a, b) {
+			out = append(out, name)
+		}
+	}
+	check("socket_path", cur.SocketPath, fresh.SocketPath)
+	check("coffer_path", cur.CofferPath, fresh.CofferPath)
+	check("idle_timeout", cur.IdleTimeout, fresh.IdleTimeout)
+	check("audit_log", cur.AuditLog, fresh.AuditLog)
+	check("pid_file", cur.PIDFile, fresh.PIDFile)
+	check("allowed_binaries", cur.AllowedBinaries, fresh.AllowedBinaries)
+	check("ntfy_topic", cur.NtfyTopic, fresh.NtfyTopic)
+	return out
 }
 
 // handleReload re-reads coffer and rebuilds the provider registry without
@@ -954,7 +1100,8 @@ func (d *Daemon) Reload() error {
 func (d *Daemon) handleReload(conn net.Conn) {
 	// Loading every provider can outlast the 30s request deadline.
 	conn.SetDeadline(time.Now().Add(protocol.LoadTimeout))
-	if err := d.Reload(); err != nil {
+	res, err := d.reloadDetailed()
+	if err != nil {
 		if errors.Is(err, ErrReloadRequiresUnlock) {
 			writeJSON(conn, protocol.ErrorResponse{
 				Error: err.Error(),
@@ -964,8 +1111,13 @@ func (d *Daemon) handleReload(conn net.Conn) {
 		}
 
 		slog.Error("reload failed", "error", err)
-		d.notifier.Send("coffer_unreadable", "Wicket: Reload Failed",
-			fmt.Sprintf("Could not re-read coffer during reload: %v", err))
+		if errors.Is(err, errReloadConfig) {
+			d.notifier.Send("config_unreadable", "Wicket: Reload Failed",
+				fmt.Sprintf("Could not re-read config.yaml during reload (current providers kept): %v", err))
+		} else {
+			d.notifier.Send("coffer_unreadable", "Wicket: Reload Failed",
+				fmt.Sprintf("Could not re-read coffer during reload: %v", err))
+		}
 		writeJSON(conn, protocol.ErrorResponse{
 			Error: fmt.Sprintf("reload failed: %v", err),
 			Code:  protocol.ErrInternalError,
@@ -978,8 +1130,11 @@ func (d *Daemon) handleReload(conn net.Conn) {
 	d.pmu.RUnlock()
 
 	writeJSON(conn, protocol.ReloadResponse{
-		Status:          "reloaded",
-		ProvidersLoaded: providersLoaded,
+		Status:           "reloaded",
+		ProvidersLoaded:  providersLoaded,
+		ProvidersAdded:   res.Added,
+		ProvidersRemoved: res.Removed,
+		ProvidersSkipped: res.Skipped,
 	})
 }
 

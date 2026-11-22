@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"strings"
 	"sync"
 	"time"
 
@@ -85,4 +86,19 @@ func (c *tokenCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string]cacheEntry)
+}
+
+// evictProvider drops every cached token minted by the named provider. Reload
+// calls it for a provider whose config changed or was removed, so a token
+// minted under the old config (e.g. wider Cloudflare permissions, a different
+// root credential) is not served until its TTL runs out.
+func (c *tokenCache) evictProvider(providerName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prefix := providerName + "/"
+	for k := range c.entries {
+		if strings.HasPrefix(k, prefix) {
+			delete(c.entries, k)
+		}
+	}
 }
