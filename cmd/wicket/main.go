@@ -322,6 +322,9 @@ func cmdReload() {
 	if len(resp.ProvidersRemoved) > 0 {
 		fmt.Fprintf(os.Stderr, "wicket: removed: %s\n", strings.Join(resp.ProvidersRemoved, ", "))
 	}
+	if len(resp.ProvidersSkipped) > 0 {
+		fmt.Fprintf(os.Stderr, "wicket: skipped, credential not in coffer: %s\n", strings.Join(resp.ProvidersSkipped, ", "))
+	}
 }
 
 // cmdAudit shows recent audit log entries.

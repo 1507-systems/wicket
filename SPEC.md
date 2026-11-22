@@ -342,8 +342,13 @@ Requires the daemon to be unlocked: if it's locked, reload returns
 `{"error": "...", "code": "LOCKED"}` rather than implicitly unlocking —
 `Lock` is a deliberate security boundary and "refresh my credentials" must
 not silently walk past it. Run `unlock` first. On success, responds with
-`{"status": "reloaded", "providers_loaded": N, "providers_added": [...], "providers_removed": [...]}`
-(the two lists are omitted when empty).
+`{"status": "reloaded", "providers_loaded": N, "providers_added": [...], "providers_removed": [...], "providers_skipped": [...]}`
+(lists omitted when empty). Added/removed compare what is actually served
+before and after; `providers_skipped` names configured providers whose
+credential is not in coffer yet, so "I added it but it isn't there" is
+visible in the CLI output. Cached tokens of a provider whose config changed
+or was removed are evicted. `lock` waits for an in-flight reload, and a
+reload re-checks the lock before swapping providers in.
 
 Reload does not clear the token cache: a cached, still-live short-lived
 token remains valid regardless of whether the root credential that minted

@@ -152,7 +152,7 @@ func installFakeCoffer(t *testing.T, binDir string) {
 		"  get)\n" +
 		"    key=$(printf '%s' \"$2\" | tr '/' '_')\n" +
 		"    if [ ! -f \"$key\" ]; then\n" +
-		"      echo \"fake coffer: no such key $2\" >&2\n" +
+		"      echo \"fake coffer: component ['$2'] not found\" >&2\n" + // real coffer (sops) wording, so ErrNotFound maps
 		"      exit 1\n" +
 		"    fi\n" +
 		"    cat \"$key\"\n" +
@@ -567,12 +567,12 @@ func TestReloadPicksUpProviderAddedToConfig(t *testing.T) {
 	}
 
 	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one", "beta": "b/two"})
-	added, removed, err := d.reloadDetailed()
+	res, err := d.reloadDetailed()
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if fmt.Sprint(added) != "[beta]" || len(removed) != 0 {
-		t.Errorf("added=%v removed=%v, want [beta] []", added, removed)
+	if fmt.Sprint(res.Added) != "[beta]" || len(res.Removed) != 0 || len(res.Skipped) != 0 {
+		t.Errorf("result=%+v, want Added [beta] only", res)
 	}
 	if got := callHandleGet(t, d, "beta", "token"); got["token"] != "v2" {
 		t.Errorf("beta after reload = %v, want v2", got)
@@ -594,16 +594,23 @@ func TestReloadDropsProviderRemovedFromConfig(t *testing.T) {
 	}
 
 	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"})
-	_, removed, err := d.reloadDetailed()
+	// Plant a cached token for beta: the registry check alone would hide it
+	// (passthrough tokens are never cached), so assert eviction directly.
+	exp := time.Now().Add(time.Hour)
+	d.cache.put("beta", "token", &provider.Token{Value: "cached", ExpiresAt: &exp}, time.Now())
+
+	res, err := d.reloadDetailed()
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if fmt.Sprint(removed) != "[beta]" {
-		t.Errorf("removed=%v, want [beta]", removed)
+	if fmt.Sprint(res.Removed) != "[beta]" {
+		t.Errorf("removed=%v, want [beta]", res.Removed)
 	}
-	// Served from neither the registry nor the token cache.
 	if got := callHandleGet(t, d, "beta", "token"); got["token"] != nil {
 		t.Errorf("removed provider still served: %v", got)
+	}
+	if d.cache.get("beta", "token", time.Now()) != nil {
+		t.Error("cached token for removed provider survived reload")
 	}
 }
 
@@ -622,5 +629,67 @@ func TestReloadKeepsProvidersWhenConfigIsBroken(t *testing.T) {
 	}
 	if got := callHandleGet(t, d, "alpha", "token"); got["token"] != "v1" {
 		t.Errorf("alpha after failed reload = %v, want v1 (still served)", got)
+	}
+}
+
+func TestReloadReportsProviderSkippedForMissingCredential(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	cfgPath := writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"})
+	d := newConfigFileDaemon(t, cfgPath)
+
+	// beta is configured before its coffer entry exists: skipped, not added.
+	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one", "beta": "b/two"})
+	res, err := d.reloadDetailed()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if len(res.Added) != 0 || fmt.Sprint(res.Skipped) != "[beta]" {
+		t.Errorf("result=%+v, want Skipped [beta], Added none", res)
+	}
+
+	// Once the credential lands, the next reload reports it as added.
+	setFakeCofferValue(t, vaultDir, "b/two", "v2")
+	res, err = d.reloadDetailed()
+	if err != nil {
+		t.Fatalf("second reload: %v", err)
+	}
+	if fmt.Sprint(res.Added) != "[beta]" || len(res.Skipped) != 0 {
+		t.Errorf("second result=%+v, want Added [beta]", res)
+	}
+}
+
+func TestReloadEvictsCacheForChangedProviderConfig(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	setFakeCofferValue(t, vaultDir, "a/other", "v9")
+	cfgPath := writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one", "keep": "a/one"})
+	d := newConfigFileDaemon(t, cfgPath)
+	exp := time.Now().Add(time.Hour)
+	d.cache.put("alpha", "token", &provider.Token{Value: "old", ExpiresAt: &exp}, time.Now())
+	d.cache.put("keep", "token", &provider.Token{Value: "kept", ExpiresAt: &exp}, time.Now())
+
+	writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/other", "keep": "a/one"})
+	if err := d.Reload(); err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if d.cache.get("alpha", "token", time.Now()) != nil {
+		t.Error("cached token for a provider whose config changed survived reload")
+	}
+	if d.cache.get("keep", "token", time.Now()) == nil {
+		t.Error("cached token for an unchanged provider was evicted")
+	}
+}
+
+func TestReloadAfterLockIsRefused(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	d := newConfigFileDaemon(t, writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"}))
+	d.Lock()
+	if err := d.Reload(); !errors.Is(err, ErrReloadRequiresUnlock) {
+		t.Fatalf("Reload() after Lock = %v, want ErrReloadRequiresUnlock", err)
 	}
 }
