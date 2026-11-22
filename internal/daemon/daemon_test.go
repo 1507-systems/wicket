@@ -150,6 +150,7 @@ func installFakeCoffer(t *testing.T, binDir string) {
 		"set -e\n" +
 		"case \"$1\" in\n" +
 		"  get)\n" +
+		"    if [ -n \"$FAKE_COFFER_SLEEP\" ]; then sleep \"$FAKE_COFFER_SLEEP\"; fi\n" +
 		"    key=$(printf '%s' \"$2\" | tr '/' '_')\n" +
 		"    if [ ! -f \"$key\" ]; then\n" +
 		"      echo \"fake coffer: component ['$2'] not found\" >&2\n" + // real coffer (sops) wording, so ErrNotFound maps
@@ -691,5 +692,46 @@ func TestReloadAfterLockIsRefused(t *testing.T) {
 	d.Lock()
 	if err := d.Reload(); !errors.Is(err, ErrReloadRequiresUnlock) {
 		t.Fatalf("Reload() after Lock = %v, want ErrReloadRequiresUnlock", err)
+	}
+}
+
+// A lock that lands while an unlock or reload is loading must win: the load
+// discards what it loaded, and the daemon ends locked.
+func TestLockDuringSlowLoadsWins(t *testing.T) {
+	binDir, vaultDir, cfgDir := t.TempDir(), t.TempDir(), t.TempDir()
+	installFakeCoffer(t, binDir)
+	setFakeCofferValue(t, vaultDir, "a/one", "v1")
+	d := newConfigFileDaemon(t, writeReloadConfig(t, cfgDir, vaultDir, map[string]string{"alpha": "a/one"}))
+	t.Setenv("FAKE_COFFER_SLEEP", "0.4")
+
+	for _, op := range []struct {
+		name string
+		run  func() error
+	}{
+		{"unlock", d.Unlock},
+		{"reload", d.Reload},
+	} {
+		if op.name == "unlock" {
+			d.Lock()
+		}
+		done := make(chan error, 1)
+		go func() { done <- op.run() }()
+		time.Sleep(150 * time.Millisecond)
+		d.Lock()
+		if err := <-done; err == nil {
+			t.Errorf("%s: returned nil after a racing lock", op.name)
+		}
+		if !d.locked.Load() {
+			t.Errorf("%s: daemon unlocked after a racing lock", op.name)
+		}
+		if got := callHandleGet(t, d, "alpha", "token"); got["token"] != nil {
+			t.Errorf("%s: token served after a racing lock: %v", op.name, got)
+		}
+		// Reset to unlocked for the next case.
+		t.Setenv("FAKE_COFFER_SLEEP", "")
+		if err := d.Unlock(); err != nil {
+			t.Fatalf("reset unlock: %v", err)
+		}
+		t.Setenv("FAKE_COFFER_SLEEP", "0.4")
 	}
 }

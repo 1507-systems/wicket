@@ -347,10 +347,12 @@ not silently walk past it. Run `unlock` first. On success, responds with
 before and after; `providers_skipped` names configured providers whose
 credential is not in coffer yet, so "I added it but it isn't there" is
 visible in the CLI output. Cached tokens of a provider whose config changed
-or was removed are evicted. `lock` waits for an in-flight reload, and a
-reload re-checks the lock before swapping providers in.
+or was removed are evicted. `lock` never waits: it flags the daemon locked
+at once, and an unlock or reload that was loading when the lock arrived
+discards what it loaded.
 
-Reload does not clear the token cache: a cached, still-live short-lived
+Reload evicts cached tokens only for providers whose config changed or was
+removed. Otherwise it does not clear the token cache: a cached, still-live short-lived
 token remains valid regardless of whether the root credential that minted
 it was just rotated (rotating a meta-token doesn't revoke tokens already
 derived from it), so cache eviction is left to the normal per-request

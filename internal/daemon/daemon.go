@@ -65,6 +65,11 @@ type Daemon struct {
 	lastRequest  atomic.Value // *time.Time
 	tokensIssued atomic.Int64
 	locked       atomic.Bool
+	// lockGen is bumped by every Lock call (even a redundant one). A load
+	// (unlock or reload) records it first and, if it changed by the time the
+	// new providers are in place, discards them: a lock that raced the load
+	// wins, without Lock having to wait for a slow load to finish.
+	lockGen atomic.Int64
 
 	// Idle timeout
 	idleTimer *time.Timer
@@ -749,7 +754,15 @@ func (d *Daemon) handleGet(conn net.Conn, req *protocol.Request, peer *PeerInfo)
 	// Cache for reuse while >30% of the TTL remains (no-op for passthrough
 	// tokens, which have no expiry; options-shaped tokens are never cached)
 	if cacheable {
-		d.cache.put(req.Provider, req.Scope, token, now)
+		// Only if this provider instance is still the one being served: a
+		// reload may have replaced it (and evicted its cache) while this
+		// token was being minted. pmu is held across check and put so the
+		// swap cannot land between them.
+		d.pmu.RLock()
+		if cur, ok := d.providers[req.Provider]; ok && cur == p {
+			d.cache.put(req.Provider, req.Scope, token, now)
+		}
+		d.pmu.RUnlock()
 	}
 
 	// Log the successful issuance
@@ -868,18 +881,20 @@ func (d *Daemon) handleLock(conn net.Conn) {
 // to locked state. The socket remains open but returns LOCKED errors.
 // Cached tokens are dropped along with the credentials that minted them.
 func (d *Daemon) Lock() {
-	// Wait out any in-flight load (startup, unlock, reload) so a reload that
-	// passed its locked check cannot swap fresh root credentials in after
-	// this lock has cleared them.
-	d.loadMu.Lock()
-	defer d.loadMu.Unlock()
-
-	if d.locked.Load() {
+	// Flag first, so a load that is swapping providers in right now sees it
+	// (see lockGen); then clear what is loaded.
+	d.lockGen.Add(1)
+	if d.locked.Swap(true) {
 		return // Already locked
 	}
 
 	slog.Info("locking daemon, clearing credentials from memory")
+	d.clearLoaded()
+}
 
+// clearLoaded zeroes the token cache and every loaded provider's root
+// credential. Used by Lock, and by a load that lost a race with Lock.
+func (d *Daemon) clearLoaded() {
 	d.cache.clear()
 
 	d.pmu.RLock()
@@ -889,8 +904,6 @@ func (d *Daemon) Lock() {
 		}
 	}
 	d.pmu.RUnlock()
-
-	d.locked.Store(true)
 }
 
 // Unlock re-reads root credentials from coffer, rebuilds the provider
@@ -903,10 +916,17 @@ func (d *Daemon) Unlock() error {
 
 	slog.Info("unlocking daemon, re-reading credentials from coffer")
 
-	if err := d.LoadProviders(); err != nil {
+	d.loadMu.Lock()
+	defer d.loadMu.Unlock()
+	gen := d.lockGen.Load()
+	if _, err := d.loadProviderSet(d.cfg.Providers); err != nil {
 		return fmt.Errorf("unlock failed: %w", err)
 	}
-
+	if d.lockGen.Load() != gen {
+		// A lock arrived while we were loading: it wins.
+		d.clearLoaded()
+		return fmt.Errorf("unlock abandoned: the daemon was locked again while loading")
+	}
 	d.locked.Store(false)
 	d.resetIdleTimer()
 	return nil
@@ -950,12 +970,11 @@ func (d *Daemon) handleUnlock(conn net.Conn) {
 // for that case.
 //
 // Reload requires the daemon to already be unlocked -- see
-// ErrReloadRequiresUnlock. It does not touch the token cache: a cached,
-// still-live short-lived token remains valid regardless of whether the root
-// credential that minted it was just rotated (rotating a meta-token doesn't
-// revoke tokens already derived from it), so unlike Lock -- which exists to
-// remove root credentials from memory entirely, cache included -- reload
-// leaves cache eviction to the normal per-request TTL check.
+// ErrReloadRequiresUnlock. It evicts cached tokens only for providers whose
+// config changed or was removed. A cached token whose provider config is
+// unchanged stays valid even if the root credential was just rotated
+// (rotating a meta-token doesn't revoke tokens already derived from it), so
+// for those, eviction is left to the normal per-request TTL check.
 //
 // Reload also re-reads config.yaml (when the daemon knows its path), so a
 // provider added to the config is picked up without a restart -- before
@@ -1007,10 +1026,16 @@ func (d *Daemon) reloadDetailed() (reloadResult, error) {
 	}
 
 	before := d.providerNames()
+	gen := d.lockGen.Load()
 	slog.Info("reloading config and credentials from coffer")
 	skipped, err := d.loadProviderSet(provs)
 	if err != nil {
 		return res, err
+	}
+	if d.lockGen.Load() != gen || d.locked.Load() {
+		// Locked while loading: do not leave fresh credentials in memory.
+		d.clearLoaded()
+		return reloadResult{}, ErrReloadRequiresUnlock
 	}
 	after := d.providerNames()
 
